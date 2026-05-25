@@ -1,0 +1,10 @@
+from db_cache import get_connection, init_db
+init_db()
+conn = get_connection()
+r = conn.execute("SELECT MIN(date),MAX(date),COUNT(DISTINCT date) FROM kline_daily WHERE code NOT LIKE 'sh.000%' AND code NOT LIKE 'sz.399%'").fetchone()
+print(f"个股数据范围: {r[0]} ~ {r[1]}, {r[2]}个交易日")
+r2 = conn.execute("SELECT MIN(date),MAX(date) FROM kline_daily WHERE code = 'sh.000001'").fetchone()
+print(f"上证指数范围: {r2[0]} ~ {r2[1]}")
+r3 = conn.execute("SELECT MIN(date),MAX(date),COUNT(DISTINCT date) FROM sector_daily").fetchone()
+print(f"板块数据范围: {r3[0]} ~ {r3[1]}, {r3[2]}个交易日")
+conn.close()
