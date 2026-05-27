@@ -1,0 +1,55 @@
+# ETF 操作提示词
+
+## 盘前/盘中选ETF
+
+请按我的 ETF 长期投资系统给我做一次 ETF 操作建议：
+
+1. 先运行 `python3 工具脚本/60_候选ETF/etf_screener.py --limit 160 --top-per-category 8 --csv 每日复盘/ETF评分结果.csv`。
+2. 如果我有持仓，再运行 `python3 工具脚本/60_候选ETF/etf_position_tracker.py report --positions 每日复盘/ETF持仓.csv --scores 每日复盘/ETF评分结果.csv --cash <我的ETF账户现金> --portfolio-value <我的ETF账户总资产>`。
+3. 结合评分结果和持仓偏离，告诉我今天哪些 ETF 可以买首批、哪些只能等回踩、哪些持有观察、哪些需要暂停或替换。
+4. 输出时必须按“核心红利、宽基核心、防守平衡、收益增强”四类分开，不要混在一起排名。
+5. 每只 ETF 都要给出：代码、名称、分类、评分、等级、当前动作、买入批次/金额、不能买的理由、下一次触发条件。
+6. 如果市场或ETF刚大涨，不要因为评分高就追，要按“高于MA20过多/近20日涨幅过高则等待回踩”的规则执行。
+
+## 只看红利现金流ETF
+
+请只按长期稳定收入目标筛选红利/高股息/低波 ETF：
+
+1. 运行 `python3 工具脚本/60_候选ETF/etf_screener.py --category CORE_DIVIDEND --limit 120 --top-per-category 12 --csv 每日复盘/ETF红利评分结果.csv`。
+2. 按稳定性优先排序，不要只看一年涨幅。
+3. 对每个候选说明：是否适合作为核心仓、是否追高、首批买入比例、后续第2/3/4批触发位置。
+4. 最后给我一句明确结论：今天买/等回踩/只观察。
+
+## 已有持仓怎么管
+
+请帮我检查 ETF 长线持仓是否需要补仓、暂停或再平衡：
+
+1. 先运行最新评分并保存：`python3 工具脚本/60_候选ETF/etf_screener.py --limit 160 --top-per-category 8 --csv 每日复盘/ETF评分结果.csv`。
+2. 再运行持仓跟踪：`python3 工具脚本/60_候选ETF/etf_position_tracker.py report --positions 每日复盘/ETF持仓.csv --scores 每日复盘/ETF评分结果.csv --cash <现金> --portfolio-value <总资产>`。
+3. 请按持仓逐只给出：继续持有、补第几批、等待回踩、不补仓、减仓再平衡、准备替换。
+4. 不要使用短线 -3% 止损逻辑；长线 ETF 只看评分降级、逻辑变坏、仓位超标和季度再平衡。
+
+## 没有持仓时制定首批计划
+
+请帮我从 ETF 评分结果里生成首批建仓计划：
+
+1. 运行评分并保存：`python3 工具脚本/60_候选ETF/etf_screener.py --limit 160 --top-per-category 8 --csv 每日复盘/ETF评分结果.csv`。
+2. 运行首批计划：`python3 工具脚本/60_候选ETF/etf_position_tracker.py buy-plan --scores 每日复盘/ETF评分结果.csv --portfolio-value <ETF账户总资产> --cash <可用现金> --top 8`。
+3. 给我一个“最多买几只、每只首批多少钱、哪类仓位还缺、哪些不能追”的执行表。
+4. 首批仅能买 A 级，且 收盘 ≤ MA60 × 1.05；否则首批降到 10%，B 级只能小仓或等待回踩。
+
+## 减仓与估值止盈
+
+请按 ETF 筛选规则 V1.1 的「必卖/减仓/估值止盈」清单，逐只检查我的 ETF 持仓：
+
+1. 先跑最新评分：`python3 工具脚本/60_候选ETF/etf_screener.py --limit 160 --top-per-category 8 --csv 每日复盘/ETF评分结果.csv`。
+2. 请逐只给出：
+   - 仓位是否超过目标上限超 5pct；
+   - 是否触发估值止盈（CORE_BROAD 估值分位 >95% / >99%，CORE_DIVIDEND 股息率被压到近 5 年最低 10% 分位）；
+   - SATELLITE 是否盈利 ≥25% 且趋势/相对强弱转弱；
+   - 是否触发风格桶超限（同桶合计超 45%）；
+   - 是否连续 2 个季度低于 72 分要降为 B；
+   - 是否触发风格漂移需要复评。
+3. 每只给出：建议减仓比例、目标持仓仓位、备选替换品。
+4. 不要使用短线 -3% 止损逻辑；估值止盈与逻辑转坏是唯一减仓理由。
+5. 减仓释出的资金，优先回填防守仓，不在同风格桶内换只买。
