@@ -245,20 +245,54 @@ def init_db():
             id           BIGINT       AUTO_INCREMENT PRIMARY KEY,
             code         VARCHAR(16)  NOT NULL,
             name         VARCHAR(64),
+            trade_date   DATE,
+            action       VARCHAR(16)  DEFAULT 'buy',
+            status       VARCHAR(16)  DEFAULT 'open',
+            strategy     VARCHAR(16),
             mode         VARCHAR(16),
             grade        VARCHAR(16),
             score        INT,
+            concept_stage VARCHAR(64),
+            concept_name  VARCHAR(128),
+            industry      VARCHAR(128),
+            entry_low     DOUBLE,
+            entry_high    DOUBLE,
             buy_date     DATE         NOT NULL,
             buy_price    DOUBLE,
+            shares        INT,
+            amount        DOUBLE,
             sell_date    DATE,
             sell_price   DOUBLE,
+            sell_reason   VARCHAR(64),
             pnl_pct      DOUBLE,
+            pnl_amount    DOUBLE,
             stop_price   DOUBLE,
+            soft_stop     DOUBLE,
             target_price DOUBLE,
+            target2_price DOUBLE,
             `position`   DOUBLE,
+            plan_source   VARCHAR(64),
+            buy_status    VARCHAR(32),
+            emotion_phase VARCHAR(32),
+            market_mode   VARCHAR(16),
+            confidence_level VARCHAR(16),
+            evidence_summary TEXT,
+            invalidation_condition TEXT,
+            risk_notes TEXT,
+            expected_horizon VARCHAR(32),
+            review_result VARCHAR(32),
+            review_date DATE,
+            pnl_1d DOUBLE,
+            pnl_3d DOUBLE,
+            pnl_5d DOUBLE,
+            review_notes TEXT,
             follow_rule  INT,
             remark       TEXT,
-            created_at   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            KEY idx_trade_status (status, trade_date),
+            KEY idx_trade_code (code),
+            KEY idx_trade_strategy (strategy, market_mode)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 
         # ═══ ETF日K数据表（结构与 kline_daily 一致，code 用6位纯数字）═══
@@ -338,7 +372,65 @@ def init_db():
             except Exception:
                 pass
 
+    _ensure_trade_log_columns(conn)
+
     conn.close()
+
+
+def _ensure_trade_log_columns(conn):
+    """Older local DBs may have a smaller trade_log schema; extend it in place."""
+    columns = {
+        row[0] for row in conn.execute(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'trade_log'"
+        ).fetchall()
+    }
+    additions = [
+        ('trade_date', "ALTER TABLE trade_log ADD COLUMN trade_date DATE AFTER name"),
+        ('action', "ALTER TABLE trade_log ADD COLUMN action VARCHAR(16) DEFAULT 'buy' AFTER trade_date"),
+        ('status', "ALTER TABLE trade_log ADD COLUMN status VARCHAR(16) DEFAULT 'open' AFTER action"),
+        ('strategy', "ALTER TABLE trade_log ADD COLUMN strategy VARCHAR(16) AFTER status"),
+        ('concept_stage', "ALTER TABLE trade_log ADD COLUMN concept_stage VARCHAR(64) AFTER score"),
+        ('concept_name', "ALTER TABLE trade_log ADD COLUMN concept_name VARCHAR(128) AFTER concept_stage"),
+        ('industry', "ALTER TABLE trade_log ADD COLUMN industry VARCHAR(128) AFTER concept_name"),
+        ('entry_low', "ALTER TABLE trade_log ADD COLUMN entry_low DOUBLE AFTER industry"),
+        ('entry_high', "ALTER TABLE trade_log ADD COLUMN entry_high DOUBLE AFTER entry_low"),
+        ('shares', "ALTER TABLE trade_log ADD COLUMN shares INT AFTER buy_price"),
+        ('amount', "ALTER TABLE trade_log ADD COLUMN amount DOUBLE AFTER shares"),
+        ('sell_reason', "ALTER TABLE trade_log ADD COLUMN sell_reason VARCHAR(64) AFTER sell_price"),
+        ('pnl_amount', "ALTER TABLE trade_log ADD COLUMN pnl_amount DOUBLE AFTER pnl_pct"),
+        ('soft_stop', "ALTER TABLE trade_log ADD COLUMN soft_stop DOUBLE AFTER stop_price"),
+        ('target2_price', "ALTER TABLE trade_log ADD COLUMN target2_price DOUBLE AFTER target_price"),
+        ('plan_source', "ALTER TABLE trade_log ADD COLUMN plan_source VARCHAR(64) AFTER `position`"),
+        ('buy_status', "ALTER TABLE trade_log ADD COLUMN buy_status VARCHAR(32) AFTER plan_source"),
+        ('emotion_phase', "ALTER TABLE trade_log ADD COLUMN emotion_phase VARCHAR(32) AFTER buy_status"),
+        ('market_mode', "ALTER TABLE trade_log ADD COLUMN market_mode VARCHAR(16) AFTER emotion_phase"),
+        ('confidence_level', "ALTER TABLE trade_log ADD COLUMN confidence_level VARCHAR(16) AFTER market_mode"),
+        ('evidence_summary', "ALTER TABLE trade_log ADD COLUMN evidence_summary TEXT AFTER confidence_level"),
+        ('invalidation_condition', "ALTER TABLE trade_log ADD COLUMN invalidation_condition TEXT AFTER evidence_summary"),
+        ('risk_notes', "ALTER TABLE trade_log ADD COLUMN risk_notes TEXT AFTER invalidation_condition"),
+        ('expected_horizon', "ALTER TABLE trade_log ADD COLUMN expected_horizon VARCHAR(32) AFTER risk_notes"),
+        ('review_result', "ALTER TABLE trade_log ADD COLUMN review_result VARCHAR(32) AFTER expected_horizon"),
+        ('review_date', "ALTER TABLE trade_log ADD COLUMN review_date DATE AFTER review_result"),
+        ('pnl_1d', "ALTER TABLE trade_log ADD COLUMN pnl_1d DOUBLE AFTER review_date"),
+        ('pnl_3d', "ALTER TABLE trade_log ADD COLUMN pnl_3d DOUBLE AFTER pnl_1d"),
+        ('pnl_5d', "ALTER TABLE trade_log ADD COLUMN pnl_5d DOUBLE AFTER pnl_3d"),
+        ('review_notes', "ALTER TABLE trade_log ADD COLUMN review_notes TEXT AFTER pnl_5d"),
+        ('updated_at', "ALTER TABLE trade_log ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at"),
+    ]
+    for column, sql in additions:
+        if column in columns:
+            continue
+        try:
+            conn.execute(sql)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+    try:
+        conn.execute("UPDATE trade_log SET trade_date = buy_date WHERE trade_date IS NULL")
+        conn.execute("UPDATE trade_log SET status = CASE WHEN sell_date IS NULL THEN 'open' ELSE 'closed' END WHERE status IS NULL")
+        conn.commit()
+    except Exception:
+        conn.rollback()
 
 
 def read_kline(code, start_date=None, end_date=None):
@@ -720,16 +812,36 @@ def get_concept_members(concept_name, source='eastmoney'):
 # ═══════════════════════════════════════════
 
 def add_trade(code, name, buy_date, buy_price, mode='A', grade='A', score=0,
-              stop_price=None, target_price=None, position=None, remark=None):
+              stop_price=None, target_price=None, position=None, remark=None,
+              strategy=None, concept_stage=None, concept_name=None, industry=None,
+              entry_low=None, entry_high=None, shares=None, amount=None,
+              soft_stop=None, target2_price=None, plan_source=None, buy_status=None,
+              emotion_phase=None, market_mode=None, confidence_level=None,
+              evidence_summary=None, invalidation_condition=None, risk_notes=None,
+              expected_horizon=None):
     """新增一条买入记录"""
+    init_db()
+    if amount is None and shares and buy_price:
+        amount = round(float(shares) * float(buy_price), 2)
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO trade_log (code, name, mode, grade, score, buy_date, buy_price,
-                               stop_price, target_price, position, remark)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (code, name, mode, grade, score, buy_date, buy_price,
-          stop_price, target_price, position, remark))
+        INSERT INTO trade_log (
+            code, name, trade_date, action, status, strategy, mode, grade, score,
+            concept_stage, concept_name, industry, entry_low, entry_high,
+            buy_date, buy_price, shares, amount, stop_price, soft_stop,
+            target_price, target2_price, position, plan_source, buy_status,
+            emotion_phase, market_mode, confidence_level, evidence_summary,
+            invalidation_condition, risk_notes, expected_horizon, follow_rule, remark
+        ) VALUES (%s, %s, %s, 'buy', 'open', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)
+    """, (
+        code, name, buy_date, strategy, mode, grade, score,
+        concept_stage, concept_name, industry, entry_low, entry_high,
+        buy_date, buy_price, shares, amount, stop_price, soft_stop,
+        target_price, target2_price, position, plan_source, buy_status,
+        emotion_phase, market_mode, confidence_level, evidence_summary,
+        invalidation_condition, risk_notes, expected_horizon, remark,
+    ))
     conn.commit()
     trade_id = cur.lastrowid
     cur.close()
@@ -737,26 +849,30 @@ def add_trade(code, name, buy_date, buy_price, mode='A', grade='A', score=0,
     return trade_id
 
 
-def close_trade(trade_id, sell_date, sell_price, follow_rule=1, remark=None):
+def close_trade(trade_id, sell_date, sell_price, follow_rule=1, remark=None, sell_reason=None):
     """平仓：填入卖出信息并自动计算盈亏"""
+    init_db()
     conn = get_connection()
-    cur = conn.execute("SELECT buy_price FROM trade_log WHERE id = %s", (trade_id,))
+    cur = conn.execute("SELECT buy_price, shares FROM trade_log WHERE id = %s", (trade_id,))
     row = cur.fetchone()
     if not row:
         conn.close()
         return False
-    buy_price = row[0]
+    buy_price, shares = row[0], row[1]
     pnl_pct = round((sell_price - buy_price) / buy_price * 100, 2) if buy_price else None
+    pnl_amount = round((sell_price - buy_price) * shares, 2) if buy_price and shares else None
     if remark:
         conn.execute("""
-            UPDATE trade_log SET sell_date=%s, sell_price=%s, pnl_pct=%s,
+            UPDATE trade_log SET trade_date=%s, action='sell', status='closed', sell_date=%s,
+                sell_price=%s, sell_reason=%s, pnl_pct=%s, pnl_amount=%s,
                 follow_rule=%s, remark=CONCAT(IFNULL(remark,''), '; ', %s) WHERE id=%s
-        """, (sell_date, sell_price, pnl_pct, follow_rule, remark, trade_id))
+        """, (sell_date, sell_date, sell_price, sell_reason, pnl_pct, pnl_amount, follow_rule, remark, trade_id))
     else:
         conn.execute("""
-            UPDATE trade_log SET sell_date=%s, sell_price=%s, pnl_pct=%s,
+            UPDATE trade_log SET trade_date=%s, action='sell', status='closed', sell_date=%s,
+                sell_price=%s, sell_reason=%s, pnl_pct=%s, pnl_amount=%s,
                 follow_rule=%s WHERE id=%s
-        """, (sell_date, sell_price, pnl_pct, follow_rule, trade_id))
+        """, (sell_date, sell_date, sell_price, sell_reason, pnl_pct, pnl_amount, follow_rule, trade_id))
     conn.commit()
     conn.close()
     return True
@@ -764,24 +880,27 @@ def close_trade(trade_id, sell_date, sell_price, follow_rule=1, remark=None):
 
 def get_open_trades():
     """获取所有未平仓记录"""
+    init_db()
     conn = get_connection()
     df = pd.read_sql_query(
-        "SELECT * FROM trade_log WHERE sell_date IS NULL ORDER BY buy_date DESC", conn)
+        "SELECT * FROM trade_log WHERE status = 'open' OR sell_date IS NULL ORDER BY buy_date DESC, id DESC", conn)
     conn.close()
     return df
 
 
 def get_trade_history(limit=50):
     """获取最近的交易记录"""
+    init_db()
     conn = get_connection()
     df = pd.read_sql_query(
-        "SELECT * FROM trade_log ORDER BY buy_date DESC LIMIT ?", conn, params=[limit])
+        "SELECT * FROM trade_log ORDER BY COALESCE(sell_date, buy_date) DESC, id DESC LIMIT ?", conn, params=[limit])
     conn.close()
     return df
 
 
 def get_trade_stats():
     """统计已平仓交易的胜率和盈亏比"""
+    init_db()
     conn = get_connection()
     cur = conn.execute("""
         SELECT COUNT(*) as total,
@@ -790,15 +909,16 @@ def get_trade_stats():
                ROUND(AVG(pnl_pct), 2) as avg_pnl,
                ROUND(AVG(CASE WHEN pnl_pct > 0 THEN pnl_pct END), 2) as avg_win,
                ROUND(AVG(CASE WHEN pnl_pct <= 0 THEN pnl_pct END), 2) as avg_loss,
+               ROUND(SUM(pnl_amount), 2) as total_pnl_amount,
                SUM(CASE WHEN follow_rule = 1 THEN 1 ELSE 0 END) as rule_follow,
                SUM(CASE WHEN follow_rule = 0 THEN 1 ELSE 0 END) as rule_break
-        FROM trade_log WHERE sell_date IS NOT NULL
+        FROM trade_log WHERE status = 'closed' OR sell_date IS NOT NULL
     """)
     row = cur.fetchone()
     conn.close()
     if not row or row[0] == 0:
         return None
-    cols = ['total', 'wins', 'losses', 'avg_pnl', 'avg_win', 'avg_loss', 'rule_follow', 'rule_break']
+    cols = ['total', 'wins', 'losses', 'avg_pnl', 'avg_win', 'avg_loss', 'total_pnl_amount', 'rule_follow', 'rule_break']
     return dict(zip(cols, row))
 
 

@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""离线选股器 V6.1 - 市场模式+情绪周期+梯队定位
+"""离线选股器 V10主线趋势版 - 市场模式+情绪周期+梯队定位
 
 根据 market_mode.py 判定的市场模式(M1-M5)：
-  - 自动启用/禁用/降级策略
-  - 动态调整板块淘汰线
+    - 自动启用/禁用/试探策略
+    - 动态调整板块准入线
   - 动态调整S3 X2放宽阈值
-V6.1新增：
+当前能力：
   - 情绪周期仓位修正(position_modifier)
   - 板块轮动加成/惩罚
   - 梯队定位(龙头/跟风/补涨)
   - 跨策略同行业去重
+    - V8 S1评分、统一止盈和概念阶段过滤
 """
 import sys, warnings
 from pathlib import Path
@@ -28,14 +29,18 @@ ensure_tool_paths()
 from db_cache import get_connection, init_db
 from market_mode import get_mode_params, detect_market_mode
 from chip_cost import analyze_chip_cost, chip_entry_check
+try:
+    from concept_rotation import analyze_concepts
+except Exception:
+    analyze_concepts = None
 import pandas as pd
 import numpy as np
 
 # ═══ V6: 先判定市场模式 ═══
 mode_key, mode_cfg, mode_details = detect_market_mode(verbose=True)
 MODE = get_mode_params()
-print(f"\n  >>> offline_screener V6.1 已加载模式: {MODE['mode']} | 综合情绪: {MODE['composite_emotion']}/10")
-print(f"  >>> 策略: S1={MODE['strategies']['S1']} S2={MODE['strategies']['S2']} S3={MODE['strategies']['S3']}")
+print(f"\n  >>> offline_screener V10主线趋势版 已加载模式: {MODE['mode']} | 综合情绪: {MODE['composite_emotion']}/10")
+print(f"  >>> 策略: S1={MODE['strategies']['S1']} S2={MODE['strategies']['S2']} S3={MODE['strategies']['S3']} S4={MODE['strategies'].get('S4', 'disabled')}")
 print(f"  >>> 情绪周期: {MODE['cycle_phase']}(得分{MODE['cycle_score']}/12)  仓位修正: {MODE['position_modifier']}")
 if MODE['cycle_warning']:
     print(f"  >>> ⚠️ {MODE['cycle_warning']}")
@@ -65,20 +70,41 @@ def _load_chip(code, price):
 
 
 def _mode_tp_tiers(mode, strategy):
-    """根据市场模式和策略返回止盈档位百分比 (tier1_pct, tier2_pct)"""
-    if strategy == 'S3':
-        # S3手册: 止盈1=+5%, 止盈2=+8%
-        if mode in ('M3', 'M4'):
-            return 0.05, 0.08
-        return 0.05, 0.08
-    # S1/S2 通用
-    if mode in ('M1', 'M2'):
-        return 0.03, 0.05
-    elif mode == 'M3':
-        return 0.03, 0.05  # +3%卖1/3, +5%卖1/3, 剩1/3移动止盈
-    elif mode == 'M4':
-        return 0.05, 0.08  # +5%卖1/3, +8%卖1/3
-    return 0.03, 0.05
+    """返回策略止盈档位：S4给主线趋势更多空间，其余沿用V8统一止盈。"""
+    if strategy == 'S4':
+        return 0.06, 0.03
+    return 0.04, 0.025
+
+
+def _role_enabled(role):
+    return role in ('primary', 'secondary', 'trial', 'watchonly')
+
+
+def _role_label(role):
+    return {'primary': '🟢主力', 'secondary': '🔵辅助', 'trial': '🟡试探', 'watchonly': '👀观察', 'disabled': '⛔禁用'}.get(role, role)
+
+
+def _position_for_candidate(candidate, pos_mod=1.0):
+    if pos_mod == 0:
+        return '禁止开仓'
+    pos_cfg = MODE.get('position', {})
+    key = f"{candidate.get('strategy', 'S1')}_{candidate.get('grade', 'A')}"
+    base_pos = pos_cfg.get(key, '1/4' if candidate.get('grade') == 'A' else '1/8')
+    role = MODE['strategies'].get(candidate.get('strategy', 'S1'), 'disabled')
+    note = _role_label(role)
+    if pos_mod < 1:
+        return f"{base_pos}×{pos_mod:g}（{note}，情绪修正）"
+    return f"{base_pos}（{note}）"
+
+
+def _sector_cutoff_for(strategy):
+    cutoff = MODE.get('sector_cutoff', {}).get(strategy)
+    if cutoff is not None:
+        return cutoff
+    role = MODE['strategies'].get(strategy, 'disabled')
+    if role == 'trial':
+        return {'M1': 0.50, 'M2': 0.60, 'M3': 0.70, 'M4': 0.70}.get(MODE['mode'], 0.70)
+    return 0.50
 
 
 def _compute_plan(strategy, c, chip, mode):
@@ -111,6 +137,10 @@ def _compute_plan(strategy, c, chip, mode):
         entry_basis = f"大阳收盘{bc_close:.2f}±2%"
         if sz and sz[1] >= base_lo:
             entry_basis += f" 筹码支撑{sz[0]:.2f}~{sz[1]:.2f}托底"
+    elif strategy == 'S4':
+        entry_lo = max(price * 0.98, c['ma5'] * 0.995)
+        entry_hi = min(price * 1.01, c['ma5'] * 1.05)
+        entry_basis = "主线趋势跟随区(MA5上方0~5%，不等缩量)"
     else:  # S3
         entry_lo = price * 0.985
         entry_hi = price * 1.015
@@ -120,39 +150,26 @@ def _compute_plan(strategy, c, chip, mode):
             entry_lo = max(entry_lo, sz[1] * 0.99)
             entry_basis += f" 筹码{sz[1]:.2f}托底"
 
-    # ═══ 2. 止盈目标 → 优先用筹码压力区 ═══
-    tp1_pct, tp2_pct = _mode_tp_tiers(mode, strategy)
+    # ═══ 2. 止盈目标 → V8统一+4%，筹码压力只做风险提示 ═══
+    tp1_pct, trail_pct = _mode_tp_tiers(mode, strategy)
     fallback_tp1 = price * (1 + tp1_pct)
-    fallback_tp2 = price * (1 + tp2_pct)
+    fallback_tp2 = price * (1 + tp1_pct + trail_pct)
+    tp_label = f"+{tp1_pct:.0%}"
+    tp_prefix = "S4主线趋势" if strategy == 'S4' else "V8统一"
 
     if rz:
-        # 压力区下沿=第一止盈目标（到了就有抛压，先落袋）
-        # 压力区上沿=第二止盈目标（突破才能到）
-        tp1 = rz[0]
-        tp2 = rz[1]
-        # 安全检查：如果压力区离现价太近(<1.5%)或太远(>15%)，回退百分比
-        dist1 = (tp1 - price) / price
-        dist2 = (tp2 - price) / price
-        if dist1 < 0.015:
-            # 压力区就在头顶——用压力区上沿作tp1，百分比作tp2
-            tp1 = rz[1]
-            tp2 = fallback_tp2
-            tp1_basis = f"压力区上沿{rz[1]:.2f}"
-            tp2_basis = f"百分比+{tp2_pct:.0%}"
-        elif dist1 > 0.15:
-            # 压力区太远，回退百分比
-            tp1 = fallback_tp1
-            tp2 = fallback_tp2
-            tp1_basis = f"+{tp1_pct:.0%}(压力区{rz[0]:.2f}过远)"
-            tp2_basis = f"+{tp2_pct:.0%}"
+        tp1 = fallback_tp1
+        tp2 = fallback_tp2
+        if rz[0] <= fallback_tp1:
+            tp1_basis = f"{tp_prefix}{tp_label}，但压力区{rz[0]:.2f}~{rz[1]:.2f}在目标内，需提前减仓"
         else:
-            tp1_basis = f"筹码压力区下沿{rz[0]:.2f}"
-            tp2_basis = f"筹码压力区上沿{rz[1]:.2f}"
+            tp1_basis = f"{tp_prefix}{tp_label}，上方压力{rz[0]:.2f}~{rz[1]:.2f}作参考"
+        tp2_basis = f"移动止盈：最高点回落{trail_pct:.1%}全清"
     else:
         tp1 = fallback_tp1
         tp2 = fallback_tp2
-        tp1_basis = f"+{tp1_pct:.0%}"
-        tp2_basis = f"+{tp2_pct:.0%}"
+        tp1_basis = tp_label
+        tp2_basis = f"移动止盈：最高点回落{trail_pct:.1%}全清"
 
     # ═══ 3. 止损 → 优先用历史支撑 ═══
     soft_stop = price * 0.985  # 通用软止损: 收盘-1.5%
@@ -174,6 +191,9 @@ def _compute_plan(strategy, c, chip, mode):
         else:
             hard_stop = pct_stop
             stop_basis = f"盘中-3%"
+    elif strategy == 'S4':
+        hard_stop = max(price * 0.97, c['ma5'] * 0.985)
+        stop_basis = "MA5×0.985或盘中-3%较近者(跌破=主线趋势失效)"
     else:  # S1
         # S1: ①筹码支撑 ②MA60×0.98 取较近的
         ma60_stop = c['ma60'] * 0.98
@@ -198,6 +218,24 @@ def _compute_plan(strategy, c, chip, mode):
     }
 
 
+def _buy_status_for_candidate(candidate):
+    chip = _load_chip(candidate['code'], candidate['price'])
+    plan = _compute_plan(candidate.get('strategy', 'S1'), candidate, chip, MODE['mode'])
+    price = candidate['price']
+    if price > plan['entry_hi']:
+        return '等回踩'
+    if price < plan['entry_lo']:
+        return '等确认'
+    reward = plan['tp1'] - price
+    risk = price - plan['hard_stop']
+    rr_now = reward / risk if risk > 0 else 0
+    if rr_now >= 1.25:
+        return '可买'
+    if rr_now >= 1.0:
+        return '小仓'
+    return '仅观察'
+
+
 def _print_plan(plan, mode, strategy):
     """打印操作计划"""
     p = plan
@@ -211,9 +249,12 @@ def _print_plan(plan, mode, strategy):
     else:
         tp_note = "卖1/2 → 全清"
 
-    print(f"  ── 操作计划 ({mode}止盈) ──")
+    plan_title = "S4主线趋势止盈" if strategy == 'S4' else "V8统一止盈"
+    print(f"  ── 操作计划 ({plan_title}) ──")
     print(f"  入场区间: {p['entry_lo']:.2f} ~ {p['entry_hi']:.2f}  ← {p['entry_basis']}")
-    print(f"  止盈1: {p['tp1']:.2f}  ← {p['tp1_basis']}  │ {tp_note}")
+    tp1_pct, _trail_pct = _mode_tp_tiers(mode, strategy)
+    tp_action = "+6%卖1/3" if strategy == 'S4' else "+4%卖50%"
+    print(f"  止盈1: {p['tp1']:.2f}  ← {p['tp1_basis']}  │ {tp_action}")
     print(f"  止盈2: {p['tp2']:.2f}  ← {p['tp2_basis']}")
     print(f"  软止损(收盘-1.5%): {p['soft_stop']:.2f}  硬止损: {p['hard_stop']:.2f}  ← {p['stop_basis']}")
     # 盈亏比
@@ -222,7 +263,7 @@ def _print_plan(plan, mode, strategy):
     risk = mid_entry - p['hard_stop']
     if risk > 0:
         rr = reward / risk
-        rr_tag = "✅" if rr >= 2 else "⚠️" if rr >= 1.5 else "❌"
+        rr_tag = "✅" if rr >= 1.25 else "⚠️" if rr >= 1.0 else "❌"
         print(f"  盈亏比: {rr:.1f}:1 {rr_tag}  (止盈1距离{reward:.2f} / 硬止损距离{risk:.2f})")
 
 
@@ -328,6 +369,89 @@ for s in rot.get('rising', []):
 for s in rot.get('falling', []):
     rotation_falling.add(s.get('industry', ''))
 
+# === V9: 概念主线阶段映射 ===
+CONCEPT_STAGE_BONUS = {
+    '主线': 2,
+    '主线分歧': 1,
+    '新晋发酵': 1,
+    '强势观察': 0,
+    '普通轮动': 0,
+    '高潮谨慎': -2,
+    '退潮回避': -3,
+}
+CONCEPT_HARD_EXCLUDE = {'退潮回避'}
+
+
+def _load_concept_stage_by_code():
+    """返回 code → 最优概念阶段，用于候选加权/降级。"""
+    if analyze_concepts is None:
+        print("  概念阶段: concept_rotation.py 不可导入，跳过概念加权")
+        return {}
+    try:
+        concept_result = analyze_concepts(days=120, top=200, source='auto')
+        if concept_result.get('error'):
+            print(f"  概念阶段: {concept_result['error']}，跳过概念加权")
+            return {}
+        concept_stage = {}
+        for group in ('top', 'mainline', 'divergence', 'emerging', 'climax', 'falling'):
+            for item in concept_result.get(group, []):
+                name = item.get('concept_name')
+                if not name:
+                    continue
+                stage = item.get('stage', '普通轮动')
+                bonus = CONCEPT_STAGE_BONUS.get(stage, 0)
+                score = item.get('score', 0)
+                old = concept_stage.get(name)
+                if old is None or (bonus, score) > (old['bonus'], old['score']):
+                    concept_stage[name] = {'stage': stage, 'bonus': bonus, 'score': score}
+        if not concept_stage:
+            print("  概念阶段: 无可用概念阶段，跳过概念加权")
+            return {}
+        names = list(concept_stage.keys())
+        code_stage = {}
+        chunk_size = 200
+        for start_idx in range(0, len(names), chunk_size):
+            chunk = names[start_idx:start_idx + chunk_size]
+            placeholders = ','.join(['?'] * len(chunk))
+            rows = conn.execute(
+                f"SELECT concept_name, code FROM concept_member WHERE concept_name IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for concept_name, code in rows:
+                meta = concept_stage.get(concept_name)
+                if not meta:
+                    continue
+                item = {
+                    'concept_name': concept_name,
+                    'concept_stage': meta['stage'],
+                    'concept_bonus': meta['bonus'],
+                    'concept_score': meta['score'],
+                }
+                old = code_stage.get(code)
+                if old is None or (item['concept_bonus'], item['concept_score']) > (old['concept_bonus'], old['concept_score']):
+                    code_stage[code] = item
+        print(f"  概念阶段: {len(code_stage)} 只股票已映射主线/分歧/退潮标签")
+        return code_stage
+    except Exception as exc:
+        print(f"  概念阶段加载失败: {exc}")
+        return {}
+
+
+concept_stage_by_code = _load_concept_stage_by_code()
+
+
+def _concept_meta(code):
+    return concept_stage_by_code.get(code, {
+        'concept_name': '',
+        'concept_stage': '—',
+        'concept_bonus': 0,
+        'concept_score': 0,
+    })
+
+
+def _concept_blocked(concept_meta):
+    return concept_meta.get('concept_stage') in CONCEPT_HARD_EXCLUDE
+
 # === 大盘环境 ===
 print("=" * 80)
 print("  大盘环境速览 (缓存数据)")
@@ -362,20 +486,24 @@ for idx_code, idx_name in [('sh.000001','上证指数'),('sz.399001','深证成�
 
 # ═══ V6: S1策略状态检查 ═══
 s1_role = MODE['strategies'].get('S1', 'disabled')
-s1_cutoff = MODE['sector_cutoff'].get('S1', 0.30) or 0.30
+s1_cutoff = _sector_cutoff_for('S1')
 
 print()
 print("=" * 80)
 if s1_role == 'disabled':
     print(f"  S1 蓄力候选 ⛔ 当前{MODE['mode']}模式禁用")
     print("=" * 80)
+elif s1_role == 'trial':
+    print(f"  S1 蓄力候选 🟡 当前{MODE['mode']}模式仅A级试探仓 ({len(codes)}只缓存股票)")
+    print(f"  板块准入线: 强度分位≥{s1_cutoff:.2f}")
+    print("=" * 80)
 elif s1_role == 'watchonly':
     print(f"  S1 蓄力候选 👀 当前{MODE['mode']}模式降为观察池 ({len(codes)}只缓存股票)")
-    print(f"  板块淘汰线: 后{int(s1_cutoff*100)}%")
+    print(f"  板块准入线: 强度分位≥{s1_cutoff:.2f}")
     print("=" * 80)
 else:
-    print(f"  蓄力候选扫描 ({len(codes)}只缓存股票)")
-    print(f"  板块淘汰线: 后{int(s1_cutoff*100)}%")
+    print(f"  蓄力候选扫描 {_role_label(s1_role)} ({len(codes)}只缓存股票)")
+    print(f"  板块准入线: 强度分位≥{s1_cutoff:.2f}")
     print("=" * 80)
 print()
 
@@ -447,6 +575,44 @@ for code in (codes if s1_role != 'disabled' else []):
     vol_min60 = np.min(vols[-60:])
     floor_vol = vols[-1] <= vol_min60 * 1.2
 
+    ind = industry_map.get(code, '')
+    sec_pct = sector_rank.get(ind, 0.5)
+    if sec_pct < s1_cutoff and ind:
+        continue
+    sec_bonus = 1 if sec_pct >= 0.7 else 0
+    t_info = stock_tier.get(code, {})
+    tier_label = t_info.get('tier', '—')
+    tier_rank = t_info.get('rank_pct', 0.5)
+    rot_bonus = 1 if ind in rotation_rising else (-1 if ind in rotation_falling else 0)
+    concept_meta = _concept_meta(code)
+    if _concept_blocked(concept_meta):
+        continue
+    concept_bonus = concept_meta.get('concept_bonus', 0)
+
+    # V8新增排除项：放量滞涨、缩量假反弹、逼近套牢密集区
+    vol_stall = False
+    for j in range(max(0, n - 3), n):
+        start = max(0, j - 5)
+        prev_avg_vol = np.mean(vols[start:j]) if j > start else vol20
+        if prev_avg_vol > 0 and vols[j] > prev_avg_vol * 1.5 and pcts[j] < 1:
+            vol_stall = True
+            break
+    if vol_stall:
+        continue
+
+    shrink_rebound = np.sum(pcts[-3:]) > 3 and vols[-1] < vols[-2] < vols[-3]
+    if shrink_rebound:
+        continue
+
+    try:
+        chip_for_score = analyze_chip_cost(df, current_price=last)
+    except Exception:
+        chip_for_score = None
+    if chip_for_score and chip_for_score.get('resistance_zone'):
+        rz = chip_for_score['resistance_zone']
+        if rz[0] <= last * 1.05:
+            continue
+
     score = 0; details = []
     sc1 = sum([0.4 <= vr520 <= 0.8, vr560 <= 0.7, turn5 <= 2, vol_dec, floor_vol])
     if sc1 >= 4: score += 3; details.append("①缩量3")
@@ -454,70 +620,62 @@ for code in (codes if s1_role != 'disabled' else []):
     elif sc1 >= 1: score += 1; details.append("①缩量1")
     else: details.append("①缩量0")
 
+    # ② 波动收敛（5分）：ATR、价格区间、均线间距、重心、支撑
     c5 = cls[-5:]; rng5 = (np.max(c5) - np.min(c5)) / np.mean(c5) * 100
     cs = (np.mean(cls[-5:]) - np.mean(cls[-10:])) / np.mean(cls[-10:]) * 100
-    # 横盘天数：连续收盘价在±2.5%区间内的天数
-    hp_days = 0
-    if n >= 15:
-        mid = np.mean(cls[-5:])
-        for di in range(min(20, n)):
-            if abs(cls[-(di+1)] - mid) / mid * 100 <= 2.5:
-                hp_days += 1
-            else:
-                break
-    sc2 = sum([rng5 <= 5, abs(cs) <= 1, last > ma60, hp_days >= 5])
-    if sc2 >= 4: score += 4; details.append(f"②横盘4({hp_days}d)")
-    elif sc2 >= 3: score += 3; details.append(f"②横盘3({hp_days}d)")
-    elif sc2 >= 2: score += 2; details.append(f"②横盘2({hp_days}d)")
-    elif sc2 >= 1: score += 1; details.append(f"②横盘1({hp_days}d)")
-    else: details.append("②横盘0")
-
     ma_sp = (max(ma5,ma10,ma20) - min(ma5,ma10,ma20)) / ((ma5+ma10+ma20)/3) * 100
-    sc3 = sum([ma_sp <= 3, last > ma60, ma5 > ma10 or ma5/ma10 > 0.995])
-    if sc3 >= 3: score += 4; details.append("③均线4")
-    elif sc3 >= 2: score += 3; details.append("③均线3")
-    elif sc3 >= 1: score += 2; details.append("③均线2")
-    else: details.append("③均线0")
+    true_ranges = []
+    for tr_i in range(1, n):
+        true_ranges.append(max(
+            his[tr_i] - los[tr_i],
+            abs(his[tr_i] - cls[tr_i - 1]),
+            abs(los[tr_i] - cls[tr_i - 1]),
+        ))
+    atr5 = np.mean(true_ranges[-5:]) if len(true_ranges) >= 5 else 999
+    atr20 = np.mean(true_ranges[-20:]) if len(true_ranges) >= 20 else atr5
+    atr_ratio = atr5 / atr20 if atr20 > 0 else 999
+    prev_low = np.min(los[-25:-5]) if n >= 25 else np.min(los[:-5]) if n > 5 else ma60
+    support_ok = bool(np.all(cls[-5:] > ma60) or np.all(cls[-5:] >= prev_low))
+    sc2 = sum([atr_ratio <= 0.6, rng5 <= 5, ma_sp <= 3, abs(cs) <= 1, support_ok])
+    if sc2 >= 5: score += 5; details.append("②收敛5")
+    elif sc2 >= 4: score += 4; details.append("②收敛4")
+    elif sc2 >= 3: score += 3; details.append("②收敛3")
+    elif sc2 >= 2: score += 1; details.append("②收敛1")
+    else: details.append("②收敛0")
 
-    bodies = np.abs(cls - ops)
-    br = np.mean(bodies[-5:]) / np.mean(bodies[-20:]) if np.mean(bodies[-20:]) > 0 else 999
-    amp3 = np.max((his[-3:] - los[-3:]) / cls[-4:-1] * 100) if n >= 4 else 999
-    pct_abs5 = np.mean(np.abs(pcts[-5:]))
-    sc4 = sum([br <= 0.5, amp3 <= 3, pct_abs5 <= 1.5])
-    if sc4 >= 3: score += 3; details.append("④实体3")
-    elif sc4 >= 2: score += 2; details.append("④实体2")
-    elif sc4 >= 1: score += 1; details.append("④实体1")
-    else: details.append("④实体0")
-
-    lsb = 0
-    for i in range(-5, 0):
-        o, c, h, l = ops[i], cls[i], his[i], los[i]
-        body = abs(c - o); ls_len = min(o, c) - l
-        if c > o and body > 0 and ls_len >= 2 * body and pcts[i] <= 2:
-            lsb += 1
-    if lsb >= 2: score += 2; details.append("⑤下影2")
-    elif lsb >= 1: score += 1; details.append("⑤下影1")
-    else: details.append("⑤下影0")
-
-    doji = 0
-    for i in range(-5, 0):
-        o, c, h, l = ops[i], cls[i], his[i], los[i]
-        body = abs(c - o); bp = body / o * 100 if o > 0 else 999
-        shadow = max(h - max(o, c), min(o, c) - l)
-        if bp <= 0.5 and body > 0 and shadow >= 2 * body:
-            doji += 1
-    if doji >= 2: score += 2; details.append("⑥十字2")
-    elif doji >= 1: score += 1; details.append("⑥十字1")
-    else: details.append("⑥十字0")
+    # ③ 板块内排名（3分）：龙头/跟风 + 板块准入
+    if tier_rank <= 0.15 and sec_pct >= 0.50:
+        score += 3; details.append("③板块3")
+    elif tier_rank <= 0.50 and sec_pct >= 0.50:
+        score += 2; details.append("③板块2")
+    elif tier_rank <= 0.50 or sec_pct >= 0.50:
+        score += 1; details.append("③板块1")
+    else:
+        details.append("③板块0")
 
     colors = ['R' if cls[i] >= ops[i] else 'G' for i in range(-5, 0)]
     no3 = all(not (colors[i] == colors[i+1] == colors[i+2]) for i in range(3))
     pct5r = all(-2 <= pcts[i] <= 2 for i in range(-5, 0))
     pct5s = np.sum(pcts[-5:])
-    sc7 = sum([no3, pct5r, -2 <= pct5s <= 3])
-    if sc7 >= 3: score += 2; details.append("⑦交替2")
-    elif sc7 >= 2: score += 1; details.append("⑦交替1")
-    else: details.append("⑦交替0")
+    sc4 = sum([no3, pct5r, -2 <= pct5s <= 3])
+    if sc4 >= 3: score += 2; details.append("④交替2")
+    elif sc4 >= 1: score += 1; details.append("④交替1")
+    else: details.append("④交替0")
+
+    # ⑤ 筹码结构（3分）：获利盘、上方压力、集中度
+    if chip_for_score:
+        chip_checks = [
+            chip_for_score.get('profit_ratio', 0) >= 0.70,
+            not chip_for_score.get('resistance_zone') or chip_for_score['resistance_zone'][0] > last * 1.05,
+            chip_for_score.get('chip_concentration', 1) <= 0.15,
+        ]
+        sc5 = sum(chip_checks)
+        if sc5 >= 3: score += 3; details.append("⑤筹码3")
+        elif sc5 == 2: score += 2; details.append("⑤筹码2")
+        elif sc5 == 1: score += 1; details.append("⑤筹码1")
+        else: details.append("⑤筹码0")
+    else:
+        details.append("⑤筹码0")
 
     signals = []
     if n >= 12:
@@ -531,24 +689,14 @@ for code in (codes if s1_role != 'disabled' else []):
     if n >= 15 and cls[-1] > np.max(cls[-15:-1]) and pcts[-1] > 0:
         signals.append("突破横盘上沿")
 
-    grade = 'A' if score >= 16 else 'B' if score >= 10 else 'C'
+    grade = 'A' if score >= 13 else 'B' if score >= 11 else 'C'
 
-    # V3: B级只保留15分，低分B淘汰
-    if grade == 'A' or (grade == 'B' and score >= 15):
-        # V6: 按模式调整板块淘汰线
-        ind = industry_map.get(code, '')
-        sec_pct = sector_rank.get(ind, 0.5)
-        if sec_pct < s1_cutoff and ind:
-            continue  # 板块弱于该模式淘汰线，跳过
-        sec_bonus = 1 if sec_pct >= 0.7 else 0
+    if grade == 'A' or (grade == 'B' and s1_role != 'trial'):
         recent_low5 = float(np.min(los[-5:]))
-        # V6.1: 梯队定位 + 轮动加成
-        t_info = stock_tier.get(code, {})
-        tier_label = t_info.get('tier', '—')
-        tier_rank = t_info.get('rank_pct', 0.5)
-        rot_bonus = 1 if ind in rotation_rising else (-1 if ind in rotation_falling else 0)
+        base_score = score
+        rank_score = base_score + rot_bonus + concept_bonus
         results.append({
-            'code': code, 'price': last, 'score': score + rot_bonus, 'grade': grade,
+            'code': code, 'price': last, 'score': rank_score, 'base_score': base_score, 'grade': grade,
             'details': ' '.join(details),
             'signals': '|'.join(signals) if signals else '',
             'vr520': vr520, 'turn5': turn5, 'ma_sp': ma_sp, 'rng5': rng5,
@@ -557,6 +705,7 @@ for code in (codes if s1_role != 'disabled' else []):
             'industry': ind, 'sector_bonus': sec_bonus,
             'recent_low5': recent_low5,
             'tier': tier_label, 'tier_rank': tier_rank, 'rot_bonus': rot_bonus,
+            **concept_meta,
             'strategy': 'S1',
         })
 
@@ -571,6 +720,8 @@ elif s1_role == 'watchonly':
     print(f"  通过筛选: {len(results)} 只 (👀观察池，不下单)")
     for r in results:
         r['watchonly'] = True
+elif s1_role == 'trial':
+    print(f"  通过筛选: {len(results)} 只 (🟡试探仓，仅A级进入)")
 else:
     print(f"  通过筛选: {len(results)} 只")
 print()
@@ -598,7 +749,8 @@ if results:
         print(f"  量比(5/20): {c['vr520']:.2f}  5日换手: {c['turn5']:.2f}%  均线间距: {c['ma_sp']:.2f}%")
         print(f"  5日波幅: {c['rng5']:.2f}%  重心偏移: {c['cs']:+.2f}%")
         print(f"  60日涨幅: {c['pct60']:+.1f}%  高点回撤: {c['dd60']:+.1f}%")
-        print(f"  评分: {c['score']}/20 ({c['grade']}级)")
+        rank_note = f" 排序分:{c['score']}" if c.get('score') != c.get('base_score') else ""
+        print(f"  评分: {c.get('base_score', c['score'])}/16 ({c['grade']}级){rank_note}")
         print(f"  指标: {c['details']}")
         if c['signals']:
             print(f"  信号: {c['signals']}")
@@ -622,7 +774,7 @@ else:
 
 # V6: S2策略状态检查
 s2_role = MODE['strategies'].get('S2', 'disabled')
-s2_cutoff = MODE['sector_cutoff'].get('S2', 0.30) or 0.30
+s2_cutoff = _sector_cutoff_for('S2')
 
 print()
 print("=" * 80)
@@ -630,9 +782,9 @@ if s2_role == 'disabled':
     print(f"  S2 大阳后缩量横盘 ⛔ 当前{MODE['mode']}模式禁用")
     print("=" * 80)
 else:
-    role_tag = "🟢主力" if s2_role == 'primary' else "🔵辅助"
+    role_tag = _role_label(s2_role)
     print(f"  S2 大阳后缩量横盘扫描 {role_tag} ({len(codes)}只缓存股票)")
-    print(f"  板块淘汰线: 后{int(s2_cutoff*100)}%")
+    print(f"  板块准入线: 强度分位≥{s2_cutoff:.2f}")
     print("=" * 80)
     print()
 
@@ -749,14 +901,20 @@ for code in (codes if s2_role != 'disabled' else []):
     else: details.append("④均线0")
 
     grade = 'A' if score >= 7 else ('B' if score >= 6 else 'C')
-    if grade in ('A', 'B'):
+    if grade == 'A' or (grade == 'B' and s2_role != 'trial'):
         # V6.1: 梯队定位 + 轮动加成
         t_info = stock_tier.get(code, {})
         tier_label = t_info.get('tier', '—')
         tier_rank = t_info.get('rank_pct', 0.5)
         rot_bonus = 1 if ind in rotation_rising else (-1 if ind in rotation_falling else 0)
+        concept_meta = _concept_meta(code)
+        if _concept_blocked(concept_meta):
+            continue
+        concept_bonus = concept_meta.get('concept_bonus', 0)
+        base_score = score
+        rank_score = base_score + rot_bonus + concept_bonus
         s2_results.append({
-            'code': code, 'price': last, 'score': score + rot_bonus, 'grade': grade,
+            'code': code, 'price': last, 'score': rank_score, 'base_score': base_score, 'grade': grade,
             'details': ' '.join(details),
             'bc_date': bc_date, 'bc_pct': bc_pct, 'bc_close': bc_close,
             'bc_open': bc_open, 'vol_shrink': vol_shrink,
@@ -766,6 +924,7 @@ for code in (codes if s2_role != 'disabled' else []):
             'industry': ind, 'sector_bonus': 1 if sec_pct >= 0.7 else 0,
             'float_mcap': float_mcap,
             'tier': tier_label, 'tier_rank': tier_rank, 'rot_bonus': rot_bonus,
+            **concept_meta,
             'strategy': 'S2',
         })
 
@@ -796,7 +955,8 @@ if s2_results:
         print(f"  大阳线: {c['bc_date']} 涨{c['bc_pct']:+.1f}% (收{c['bc_close']:.2f} 开{c['bc_open']:.2f})")
         print(f"  缩量比: {c['vol_shrink']:.2f}  价格守住: {c['price_hold']:.2%}  已过{c['days_after']}天")
         print(f"  MA5={c['ma5']:.2f}  MA10={c['ma10']:.2f}  MA20={c['ma20']:.2f}  MA60={c['ma60']:.2f}")
-        print(f"  评分: {c['score']}/8 ({c['grade']}级)")
+        rank_note = f" 排序分:{c['score']}" if c.get('score') != c.get('base_score') else ""
+        print(f"  评分: {c.get('base_score', c['score'])}/8 ({c['grade']}级){rank_note}")
         print(f"  明细: {c['details']}")
 
         # ═══ V7: 基于历史数据的操作计划 ═══
@@ -817,7 +977,7 @@ else:
 
 # V6: S3策略状态检查
 s3_role = MODE['strategies'].get('S3', 'disabled')
-s3_cutoff = MODE['sector_cutoff'].get('S3', 0.50) or 0.50
+s3_cutoff = _sector_cutoff_for('S3')
 s3_x2_limit = MODE['s3_x2_limit']
 s3_x2_relax = MODE['s3_x2_relax']
 
@@ -827,9 +987,9 @@ if s3_role == 'disabled':
     print(f"  S3 放量突破新高 ⛔ 当前{MODE['mode']}模式禁用")
     print("=" * 80)
 else:
-    role_tag = "🟢主力" if s3_role == 'primary' else "🔵辅助"
+    role_tag = _role_label(s3_role)
     print(f"  S3 放量突破新高扫描 {role_tag} ({len(codes)}只缓存股票)")
-    print(f"  板块淘汰线: 后{int(s3_cutoff*100)}%  X2限制: 5日涨>{s3_x2_limit}%排除")
+    print(f"  板块准入线: 强度分位≥{s3_cutoff:.2f}  X2限制: 5日涨>{s3_x2_limit}%排除")
     if s3_x2_relax:
         for cond, val in s3_x2_relax.items():
             print(f"  X2放宽: {cond} → 允许到{val}%")
@@ -924,15 +1084,21 @@ for code in (codes if s3_role != 'disabled' else []):
     else: details.append("③板块0")
 
     grade = 'A' if score >= 5 else ('B' if score >= 4 else 'C')
-    if grade in ('A', 'B'):
+    if grade == 'A' or (grade == 'B' and s3_role != 'trial'):
         ma5 = np.mean(cls[-5:]); ma10 = np.mean(cls[-10:])
         # V6.1: 梯队定位 + 轮动加成
         t_info = stock_tier.get(code, {})
         tier_label = t_info.get('tier', '—')
         tier_rank = t_info.get('rank_pct', 0.5)
         rot_bonus = 1 if ind in rotation_rising else (-1 if ind in rotation_falling else 0)
+        concept_meta = _concept_meta(code)
+        if _concept_blocked(concept_meta):
+            continue
+        concept_bonus = concept_meta.get('concept_bonus', 0)
+        base_score = score
+        rank_score = base_score + rot_bonus + concept_bonus
         s3_results.append({
-            'code': code, 'price': last, 'score': score + rot_bonus, 'grade': grade,
+            'code': code, 'price': last, 'score': rank_score, 'base_score': base_score, 'grade': grade,
             'details': ' '.join(details),
             'brk_pct': brk_pct, 'vol_ratio': vol_ratio,
             'chg5': chg5, 'pct_today': pcts[-1],
@@ -940,6 +1106,7 @@ for code in (codes if s3_role != 'disabled' else []):
             'industry': ind, 'sector_bonus': 1 if sec_pct >= 0.7 else 0,
             'float_mcap': float_mcap,
             'tier': tier_label, 'tier_rank': tier_rank, 'rot_bonus': rot_bonus,
+            **concept_meta,
             'strategy': 'S3',
         })
 
@@ -970,7 +1137,8 @@ if s3_results:
         print(f"  价格: {c['price']:.2f}  今日涨跌: {c['pct_today']:+.2f}%  市值: ~{c['float_mcap']:.0f}亿")
         print(f"  突破20日高: {c['brk_pct']:+.1f}%  放量: {c['vol_ratio']:.1f}x  近5日涨: {c['chg5']:+.1f}%")
         print(f"  MA5={c['ma5']:.2f}  MA10={c['ma10']:.2f}  MA20={c['ma20']:.2f}  MA60={c['ma60']:.2f}")
-        print(f"  评分: {c['score']}/6 ({c['grade']}级)")
+        rank_note = f" 排序分:{c['score']}" if c.get('score') != c.get('base_score') else ""
+        print(f"  评分: {c.get('base_score', c['score'])}/6 ({c['grade']}级){rank_note}")
         print(f"  明细: {c['details']}")
 
         # ═══ V7: 基于历史数据的操作计划 ═══
@@ -984,12 +1152,208 @@ if s3_results:
 else:
     print("  （无符合条件的S3候选）")
 
+
+# ═══════════════════════════════════════════════════════════════
+# S4：主线趋势跟随扫描
+# ═══════════════════════════════════════════════════════════════
+
+s4_role = MODE['strategies'].get('S4', 'disabled')
+s4_cutoff = _sector_cutoff_for('S4')
+s4_allowed_stages = {'主线', '主线分歧', '新晋发酵', '强势观察'}
+
+print()
+print("=" * 80)
+if s4_role == 'disabled':
+    print(f"  S4 主线趋势跟随 ⛔ 当前{MODE['mode']}模式禁用")
+    print("=" * 80)
+else:
+    role_tag = _role_label(s4_role)
+    print(f"  S4 主线趋势跟随扫描 {role_tag} ({len(codes)}只缓存股票)")
+    print(f"  板块准入线: 强度分位≥{s4_cutoff:.2f}  只做主线/新晋发酵里的龙头或强跟风")
+    print("=" * 80)
+    print()
+
+s4_results = []
+for code in (codes if s4_role != 'disabled' else []):
+    if code.startswith('sh.000') or code.startswith('sz.399'):
+        continue
+    df = pd.read_sql('SELECT * FROM kline_daily WHERE code=? ORDER BY date', conn, params=[code])
+    if len(df) < 60:
+        continue
+    for c in ['open','high','low','close','volume','amount','turn','pctChg']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    df = df.dropna(subset=['close','volume'])
+    if len(df) < 60:
+        continue
+
+    cls = df['close'].values; ops = df['open'].values
+    his = df['high'].values; los = df['low'].values
+    vols = df['volume'].values; turns = df['turn'].values
+    pcts = df['pctChg'].values; amts = df['amount'].values
+    n = len(df); last = cls[-1]
+
+    if last < 3 or last > 200:
+        continue
+    avg_amt_20 = np.mean(amts[-20:]) / 10000
+    if avg_amt_20 < 2000:
+        continue
+
+    t_last = turns[-1] if len(turns) > 0 else 0
+    if t_last <= 0:
+        continue
+    float_mcap = (amts[-1] / (last * 100)) / (t_last / 100) * 100 * last / 1e8
+    if float_mcap < 30 or float_mcap > 800:
+        continue
+
+    ma5 = np.mean(cls[-5:]); ma10 = np.mean(cls[-10:]); ma20 = np.mean(cls[-20:]); ma60 = np.mean(cls[-60:])
+    if not (last > ma5 > ma10 and ma20 > ma60):
+        continue
+
+    ind = industry_map.get(code, '')
+    sec_pct = sector_rank.get(ind, 0.5)
+    if sec_pct < s4_cutoff and ind:
+        continue
+
+    concept_meta = _concept_meta(code)
+    if _concept_blocked(concept_meta):
+        continue
+    concept_stage = concept_meta.get('concept_stage', '—')
+    if concept_stage not in s4_allowed_stages:
+        continue
+
+    t_info = stock_tier.get(code, {})
+    tier_label = t_info.get('tier', '—')
+    tier_rank = t_info.get('rank_pct', 0.5)
+    if tier_rank > 0.50:
+        continue
+    if concept_stage != '主线' and tier_rank > 0.35:
+        continue
+
+    chg5 = (cls[-1] / cls[-6] - 1) * 100 if n >= 6 else 0
+    chg10 = (cls[-1] / cls[-11] - 1) * 100 if n >= 11 else 0
+    if chg5 < 5 or chg5 > 35:
+        continue
+    if pcts[-1] > 9.2 or turns[-1] > 12:
+        continue
+
+    dist_ma5 = (last / ma5 - 1) * 100 if ma5 > 0 else 999
+    if dist_ma5 > 5.5:
+        continue
+    day_range = his[-1] - los[-1]
+    close_pos = (last - los[-1]) / day_range if day_range > 0 else 0.5
+    if close_pos < 0.50:
+        continue
+    if concept_stage == '主线分歧' and (pcts[-1] <= 0 or close_pos < 0.65):
+        continue
+
+    vol20 = np.mean(vols[-20:])
+    vol_ratio = vols[-1] / vol20 if vol20 > 0 else 0
+    if vol_ratio < 0.80 or vol_ratio > 4.50:
+        continue
+
+    score = 0; details = []
+    if concept_stage == '主线':
+        score += 2; details.append("①主线2")
+    else:
+        score += 1; details.append(f"①{concept_stage}1")
+
+    trend_checks = sum([last > ma5, ma5 > ma10, ma10 > ma20, ma20 > ma60])
+    if trend_checks >= 4:
+        score += 2; details.append("②趋势2")
+    elif trend_checks >= 3:
+        score += 1; details.append("②趋势1")
+    else:
+        details.append("②趋势0")
+
+    if tier_rank <= 0.15 and sec_pct >= 0.75:
+        score += 2; details.append("③龙头2")
+    elif tier_rank <= 0.35 and sec_pct >= 0.70:
+        score += 1; details.append("③前排1")
+    else:
+        details.append("③梯队0")
+
+    if 8 <= chg5 <= 25 and pcts[-1] > 0:
+        score += 2; details.append(f"④强度2({chg5:+.1f}%)")
+    elif 5 <= chg5 <= 35 and pcts[-1] >= 0:
+        score += 1; details.append(f"④强度1({chg5:+.1f}%)")
+    else:
+        details.append(f"④强度0({chg5:+.1f}%)")
+
+    if dist_ma5 <= 3 and close_pos >= 0.65:
+        score += 2; details.append(f"⑤位置2(MA5+{dist_ma5:.1f}%)")
+    elif dist_ma5 <= 5.5 and close_pos >= 0.50:
+        score += 1; details.append(f"⑤位置1(MA5+{dist_ma5:.1f}%)")
+    else:
+        details.append(f"⑤位置0(MA5+{dist_ma5:.1f}%)")
+
+    if 1.1 <= vol_ratio <= 3.5:
+        score += 1; details.append(f"⑥量能1({vol_ratio:.1f}x)")
+    else:
+        details.append(f"⑥量能0({vol_ratio:.1f}x)")
+
+    grade = 'A' if score >= 8 else ('B' if score >= 7 else 'C')
+    if grade == 'A' or (grade == 'B' and s4_role != 'trial'):
+        rot_bonus = 1 if ind in rotation_rising else (-1 if ind in rotation_falling else 0)
+        concept_bonus = concept_meta.get('concept_bonus', 0)
+        base_score = score
+        rank_score = base_score + rot_bonus + concept_bonus
+        s4_results.append({
+            'code': code, 'price': last, 'score': rank_score, 'base_score': base_score, 'grade': grade,
+            'details': ' '.join(details),
+            'chg5': chg5, 'chg10': chg10, 'pct_today': pcts[-1],
+            'ma5': ma5, 'ma10': ma10, 'ma20': ma20, 'ma60': ma60,
+            'dist_ma5': dist_ma5, 'close_pos': close_pos, 'vol_ratio': vol_ratio,
+            'industry': ind, 'sector_bonus': 1 if sec_pct >= 0.75 else 0,
+            'float_mcap': float_mcap,
+            'tier': tier_label, 'tier_rank': tier_rank, 'rot_bonus': rot_bonus,
+            **concept_meta,
+            'strategy': 'S4',
+        })
+
+s4_results.sort(key=lambda x: (0 if x['grade']=='A' else 1, -x.get('sector_bonus',0), 0 if x.get('tier')=='龙头' else 1, -x['score']))
+
+if s4_role != 'disabled':
+    print(f"  通过筛选: {len(s4_results)} 只")
+print()
+if s4_results:
+    print(f"  {'排名':>4s} {'代码':<12s} {'价格':>7s} {'今涨':>7s} {'评分':>4s} {'级':>2s} {'梯队':>4s} {'板块':>10s} {'概念':>12s} {'5日涨':>7s} {'距MA5':>7s} {'量比':>6s} 明细")
+    print("-" * 150)
+    for rank, c in enumerate(s4_results[:20], 1):
+        sec_tag = f"🔥{c['industry'][:6]}" if c.get('sector_bonus') else c.get('industry','')[:8]
+        tier_tag = c.get('tier', '—')
+        rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
+        concept_text = c.get('concept_stage', '—')
+        if c.get('concept_name'):
+            concept_text = f"{concept_text}:{c['concept_name'][:6]}"
+        print(f"  {rank:>3d} {c['code']:<12s} {c['price']:>7.2f} {c['pct_today']:>+6.2f}% {c['score']:>4d} {c['grade']:>2s} {tier_tag:>4s} {sec_tag:>10s}{rot_tag} {concept_text:>12s} {c['chg5']:>+6.1f}% {c['dist_ma5']:>6.1f}% {c['vol_ratio']:>5.1f}x  {c['details']}")
+
+    print()
+    print("=" * 80)
+    print("  S4 TOP 3 详细分析")
+    print("=" * 80)
+    for rank, c in enumerate(s4_results[:3], 1):
+        ind_info = f" [{c.get('industry','')}]" if c.get('industry') else ""
+        tier_info = f" 梯队:{c.get('tier','—')}" if c.get('tier') else ""
+        print(f"\n  ── S4 #{rank} {c['code']}{ind_info}{tier_info} ──")
+        print(f"  价格: {c['price']:.2f}  今日涨跌: {c['pct_today']:+.2f}%  5日涨: {c['chg5']:+.1f}%  10日涨: {c['chg10']:+.1f}%")
+        print(f"  概念: {c.get('concept_stage','—')} {c.get('concept_name','')}  距MA5: {c['dist_ma5']:.1f}%  收盘位置: {c['close_pos']:.0%}  量比: {c['vol_ratio']:.1f}x")
+        print(f"  MA5={c['ma5']:.2f}  MA10={c['ma10']:.2f}  MA20={c['ma20']:.2f}  MA60={c['ma60']:.2f}")
+        rank_note = f" 排序分:{c['score']}" if c.get('score') != c.get('base_score') else ""
+        print(f"  评分: {c.get('base_score', c['score'])}/10 ({c['grade']}级){rank_note}")
+        print(f"  明细: {c['details']}")
+        chip = _load_chip(c['code'], c['price'])
+        plan = _compute_plan('S4', c, chip, MODE['mode'])
+        _print_plan(plan, MODE['mode'], 'S4')
+        _print_chip(chip)
+else:
+    print("  （无符合条件的S4主线趋势候选）")
+
 # ═══════════════════════════════════════════════════════════════
 # V6.1: 跨策略同行业去重 + 仓位修正 + 最终推荐
 # ═══════════════════════════════════════════════════════════════
 print()
 print("=" * 80)
-print("  V6.1 最终推荐（同行业去重 + 仓位修正）")
+print("  V10主线趋势版 最终推荐（同行业去重 + 仓位修正）")
 print("=" * 80)
 
 # 合并所有候选
@@ -1002,11 +1366,30 @@ for r in s2_results:
     all_candidates.append(r)
 for r in s3_results:
     all_candidates.append(r)
+for r in s4_results:
+    all_candidates.append(r)
+
+concept_priority_order = {'主线': 0, '新晋发酵': 1, '主线分歧': 2, '强势观察': 3, '普通轮动': 4}
+def get_concept_priority(c):
+    return concept_priority_order.get(c.get('concept_stage', '—'), 9)
+
+def get_mainline_bias(c):
+    return 0 if c.get('strategy') == 'S4' and get_concept_priority(c) <= 2 else 1
+
+strategy_priority = {'primary': 0, 'secondary': 1, 'trial': 2, 'watchonly': 3}
+def get_strategy_priority(c):
+    s = c.get('strategy', 'S1')
+    role = MODE['strategies'].get(s, 'disabled')
+    return strategy_priority.get(role, 9)
+
+buy_status_priority = {'可买': 0, '小仓': 1, '等回踩': 2, '等确认': 3, '仅观察': 4}
+for c in all_candidates:
+    c['_buy_status'] = _buy_status_for_candidate(c)
 
 # 同行业只保留最高分
 seen_industry = {}
 dedup_results = []
-for c in sorted(all_candidates, key=lambda x: -x['score']):
+for c in sorted(all_candidates, key=lambda x: (buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x), get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier')=='龙头' else 1, -x['score'])):
     ind = c.get('industry', '')
     if ind and ind in seen_industry:
         continue  # 同行业已有更高分的
@@ -1014,14 +1397,8 @@ for c in sorted(all_candidates, key=lambda x: -x['score']):
         seen_industry[ind] = c['code']
     dedup_results.append(c)
 
-# 按策略优先级排序：主力策略 > 辅助策略
-strategy_priority = {'primary': 0, 'secondary': 1, 'watchonly': 2}
-def get_strategy_priority(c):
-    s = c.get('strategy', 'S1')
-    role = MODE['strategies'].get(s, 'disabled')
-    return strategy_priority.get(role, 9)
-
-dedup_results.sort(key=lambda x: (get_strategy_priority(x), 0 if x.get('tier')=='龙头' else 1, -x['score']))
+# 按策略优先级排序：主力策略 > 辅助策略 > 试探策略
+dedup_results.sort(key=lambda x: (buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x), get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier')=='龙头' else 1, -x['score']))
 
 # 仓位修正提示
 pos_mod = MODE.get('position_modifier', 1.0)
@@ -1034,27 +1411,25 @@ if pos_mod < 1.0:
 
 if dedup_results:
     print(f"\n  去重后推荐: {len(dedup_results)} 只 (同行业仅保留最高分)")
-    print(f"  {'排名':>4s} {'策略':>4s} {'代码':<12s} {'价格':>7s} {'评分':>4s} {'梯队':>4s} {'板块':>12s} {'操作建议'}")
-    print("-" * 90)
+    print(f"  {'排名':>4s} {'策略':>4s} {'代码':<12s} {'价格':>7s} {'评分':>6s} {'梯队':>4s} {'板块':>12s} {'概念阶段':>10s} {'买点/仓位'}")
+    print("-" * 115)
     for rank, c in enumerate(dedup_results[:10], 1):
         tier_tag = c.get('tier', '—')
         rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
         ind_short = c.get('industry', '')[:10]
         s_tag = c.get('strategy', '?')
-        # 操作建议
         if pos_mod == 0:
             advice = '❌禁止开仓'
-        elif pos_mod < 1:
-            pos_cfg = MODE.get('position', {})
-            s_key = f"{s_tag}_A"
-            normal_pos = pos_cfg.get(s_key, '1/4')
-            advice = f"⚠半仓({normal_pos}→减半)"
         else:
-            pos_cfg = MODE.get('position', {})
-            s_key = f"{s_tag}_A"
-            normal_pos = pos_cfg.get(s_key, '1/4')
-            advice = f"✅正常({normal_pos})"
-        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {c['score']:>4d} {tier_tag:>4s} {ind_short:>12s}{rot_tag}  {advice}")
+            advice = f"{c.get('_buy_status', _buy_status_for_candidate(c))}｜{_position_for_candidate(c, pos_mod=pos_mod)}"
+        score_max = {'S1': 16, 'S2': 8, 'S3': 6, 'S4': 10}.get(s_tag, '?')
+        score_text = f"{c.get('base_score', c['score'])}/{score_max}"
+        if c.get('score') != c.get('base_score', c['score']):
+            score_text += f"→{c['score']}"
+        concept_text = c.get('concept_stage', '—')
+        if c.get('concept_name'):
+            concept_text = f"{concept_text}:{c['concept_name'][:6]}"
+        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {ind_short:>12s}{rot_tag} {concept_text:>10s}  {advice}")
 else:
     print("\n  （无最终推荐候选）")
 

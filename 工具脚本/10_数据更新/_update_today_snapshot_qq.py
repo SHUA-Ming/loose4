@@ -119,7 +119,8 @@ def fetch_snapshots(codes, batch_size=80, timeout=10):
             high_value = _to_float(items[33])
             low_value = _to_float(items[34])
             close_value = _to_float(items[3])
-            volume = _to_float(items[36])
+            # 腾讯 items[36] 是成交量（手），kline_daily 历史量按股口径存储。
+            volume = _to_float(items[36]) * 100
             if min(open_value, high_value, low_value, close_value) <= 0 or volume <= 0:
                 skipped["no_trade"] += 1
                 continue

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-市场模式自动识别 (V6.1)
+市场模式自动识别 (V10主线趋势版)
 判定当前属于 M1磨底 / M2震荡 / M3反弹 / M4强趋势 / M5极端
-输出对应的策略权重、板块淘汰线、S3 X2阈值等参数
+输出对应的策略角色、板块准入线、S3 X2阈值等参数
 
-V6.1新增：
+当前能力：
   - 集成情绪周期判定（涨停生态）
   - 高潮日/分歧日自动降级仓位
   - 板块轮动预判输出
+    - V8策略角色与板块准入线
 
 可独立运行查看结果，也可被 offline_screener.py import 调用
 """
@@ -31,53 +32,117 @@ import pandas as pd
 import numpy as np
 
 # ═══ 模式配置 ═══
+# sector_cutoff 语义：sector_rank 强度分位必须 >= 该值。
+# sector_rank 越接近 1 越强，所以 0.70 = 只看前30%强板块。
 MODE_CONFIG = {
     'M1': {
         'name': '磨底期', 'emoji': '🧊',
-        'desc': '缩量磨底，只做S1蓄力',
-        'strategies': {'S1': 'primary', 'S2': 'disabled', 'S3': 'disabled'},
-        'sector_cutoff': {'S1': 0.30, 'S2': None, 'S3': None},
-        'position': {'S1_A': '1/4', 'S1_B': '1/8'},
+        'desc': '缩量磨底，S1为主，S2/S3仅A级小仓试探，S4禁用',
+        'strategies': {'S1': 'primary', 'S2': 'trial', 'S3': 'trial', 'S4': 'disabled'},
+        'sector_cutoff': {'S1': 0.50, 'S2': None, 'S3': None, 'S4': None},
+        'position': {'S1_A': '1/4', 'S1_B': '1/8', 'S2_A': '1/12', 'S2_B': '1/16', 'S3_A': '1/12', 'S3_B': '1/16'},
         's3_x2_limit': 20,
         's3_x2_relax': None,
     },
     'M2': {
         'name': '震荡期', 'emoji': '🔄',
-        'desc': '方向不明，S1蓄力+S2大阳横盘',
-        'strategies': {'S1': 'primary', 'S2': 'secondary', 'S3': 'disabled'},
-        'sector_cutoff': {'S1': 0.30, 'S2': 0.30, 'S3': None},
-        'position': {'S1_A': '1/4', 'S1_B': '1/8', 'S2_A': '1/4', 'S2_B': '1/8'},
+        'desc': '方向不明，S1蓄力+S2大阳横盘，S3/S4仅A级小仓试探',
+        'strategies': {'S1': 'primary', 'S2': 'secondary', 'S3': 'trial', 'S4': 'trial'},
+        'sector_cutoff': {'S1': 0.50, 'S2': 0.60, 'S3': None, 'S4': 0.70},
+        'position': {'S1_A': '1/4', 'S1_B': '1/8', 'S2_A': '1/4', 'S2_B': '1/8', 'S3_A': '1/12', 'S3_B': '1/16', 'S4_A': '1/12', 'S4_B': '1/16'},
         's3_x2_limit': 20,
         's3_x2_relax': None,
     },
     'M3': {
         'name': '反弹修复', 'emoji': '🚀',
-        'desc': '反弹行情，S2/S3为主，S1降为观察池',
-        'strategies': {'S1': 'watchonly', 'S2': 'primary', 'S3': 'secondary'},
-        'sector_cutoff': {'S1': 0.50, 'S2': 0.40, 'S3': 0.40},
-        'position': {'S2_A': '1/4', 'S2_B': '1/8', 'S3_A': '1/4', 'S3_B': '1/8'},
+        'desc': '反弹行情，S2/S4为主，S3辅助，S1仅A级小仓试探',
+        'strategies': {'S1': 'trial', 'S2': 'primary', 'S3': 'secondary', 'S4': 'primary'},
+        'sector_cutoff': {'S1': 0.60, 'S2': 0.70, 'S3': 0.70, 'S4': 0.70},
+        'position': {'S1_A': '1/12', 'S1_B': '1/16', 'S2_A': '1/4', 'S2_B': '1/8', 'S3_A': '1/4', 'S3_B': '1/8', 'S4_A': '1/8', 'S4_B': '1/12'},
         's3_x2_limit': 25,
         's3_x2_relax': {'top30_sector': 30},
     },
     'M4': {
         'name': '强趋势', 'emoji': '🔥',
-        'desc': '趋势上升，S3突破为主，S2辅助',
-        'strategies': {'S1': 'disabled', 'S2': 'secondary', 'S3': 'primary'},
-        'sector_cutoff': {'S1': None, 'S2': 0.40, 'S3': 0.30},
-        'position': {'S2_A': '1/4', 'S2_B': '1/8', 'S3_A': '1/4', 'S3_B': '1/8'},
+        'desc': '趋势上升，S3/S4为主，S2辅助，S1仅A级小仓试探',
+        'strategies': {'S1': 'trial', 'S2': 'secondary', 'S3': 'primary', 'S4': 'primary'},
+        'sector_cutoff': {'S1': None, 'S2': 0.70, 'S3': 0.75, 'S4': 0.75},
+        'position': {'S1_A': '1/12', 'S1_B': '1/16', 'S2_A': '1/4', 'S2_B': '1/8', 'S3_A': '1/4', 'S3_B': '1/8', 'S4_A': '1/6', 'S4_B': '1/12'},
         's3_x2_limit': 35,
         's3_x2_relax': {'top20_sector': 40},
     },
     'M5': {
         'name': '过热/恐慌', 'emoji': '⛔',
         'desc': '极端行情，空仓观望',
-        'strategies': {'S1': 'disabled', 'S2': 'disabled', 'S3': 'disabled'},
-        'sector_cutoff': {'S1': None, 'S2': None, 'S3': None},
+        'strategies': {'S1': 'disabled', 'S2': 'disabled', 'S3': 'disabled', 'S4': 'disabled'},
+        'sector_cutoff': {'S1': None, 'S2': None, 'S3': None, 'S4': None},
         'position': {},
         's3_x2_limit': 20,
         's3_x2_relax': None,
     },
 }
+
+
+def _max_date(conn, sql, params=None):
+    try:
+        row = conn.execute(sql, params or []).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _check_data_freshness(conn, index_data):
+    """检查指数、个股、板块、概念数据日期是否对齐。"""
+    stock_latest = _max_date(
+        conn,
+        """
+        SELECT MAX(date)
+        FROM kline_daily
+        WHERE code NOT LIKE 'sh.000%' AND code NOT LIKE 'sz.399%'
+        """,
+    )
+    sector_latest = _max_date(conn, "SELECT MAX(date) FROM sector_daily")
+    concept_row = None
+    try:
+        concept_row = conn.execute(
+            """
+            SELECT source, MAX(date)
+            FROM concept_daily
+            GROUP BY source
+            ORDER BY MAX(date) DESC, COUNT(*) DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    except Exception:
+        concept_row = None
+
+    index_dates = [meta.get('last_date') for meta in index_data.values() if meta.get('last_date')]
+    index_latest = max(index_dates) if index_dates else None
+    concept_source = concept_row[0] if concept_row else None
+    concept_latest = concept_row[1] if concept_row else None
+    warnings_list = []
+
+    if stock_latest and index_latest and index_latest < stock_latest:
+        warnings_list.append(
+            f"指数数据滞后：指数最新{index_latest}，个股最新{stock_latest}。先运行 `python 工具脚本/10_数据更新/_fetch_market_data.py --from {stock_latest} --skip-industry`。"
+        )
+    if stock_latest and sector_latest and sector_latest < stock_latest:
+        warnings_list.append(
+            f"板块统计滞后：板块最新{sector_latest}，个股最新{stock_latest}。先运行 `python 工具脚本/10_数据更新/_fetch_market_data.py --from {stock_latest} --skip-index --skip-industry`。"
+        )
+    if stock_latest and concept_latest and concept_latest < stock_latest:
+        warnings_list.append(
+            f"概念数据滞后：{concept_source or 'concept'}最新{concept_latest}，个股最新{stock_latest}。先运行 `python 工具脚本/10_数据更新/_fetch_concept_data.py`。"
+        )
+
+    return {
+        'stock_latest': stock_latest,
+        'index_latest': index_latest,
+        'sector_latest': sector_latest,
+        'concept_source': concept_source,
+        'concept_latest': concept_latest,
+        'warnings': warnings_list,
+    }
 
 
 def detect_market_mode(verbose=True):
@@ -155,6 +220,7 @@ def detect_market_mode(verbose=True):
             'last_date': df['date'].iloc[-1],
         }
 
+    freshness = _check_data_freshness(conn, index_data)
     conn.close()
 
     if not emotions:
@@ -227,6 +293,7 @@ def detect_market_mode(verbose=True):
         'cycle_data': cycle_data,
         'position_modifier': position_modifier,
         'cycle_warning': cycle_warning,
+        'freshness': freshness,
     }
 
     if verbose:
@@ -245,7 +312,7 @@ def _print_report(mode, config, details):
     index_data = details['index_data']
 
     print("=" * 80)
-    print(f"  市场模式判定 (V6) — {config['emoji']} {mode} {config['name']}")
+    print(f"  市场模式判定 (V10主线趋势版) — {config['emoji']} {mode} {config['name']}")
     print("=" * 80)
     print()
 
@@ -268,6 +335,14 @@ def _print_report(mode, config, details):
     print(f"  判定模式: {config['emoji']} {mode} — {config['name']}")
     print(f"  描述: {config['desc']}")
 
+    freshness = details.get('freshness', {})
+    freshness_warnings = freshness.get('warnings', [])
+    if freshness_warnings:
+        print()
+        print("  ── 数据新鲜度警告 ──")
+        for warning_text in freshness_warnings:
+            print(f"    ⚠️ {warning_text}")
+
     # V6.1: 情绪周期信息
     cycle_phase = details.get('cycle_phase', '未知')
     cycle_score = details.get('cycle_score', 0)
@@ -284,16 +359,20 @@ def _print_report(mode, config, details):
     print()
     print("  ── 策略配置 ──")
     for s, role in config['strategies'].items():
-        icon = {'primary': '🟢主力', 'secondary': '🔵辅助', 'watchonly': '👀观察', 'disabled': '⛔禁用'}[role]
+        icon = {'primary': '🟢主力', 'secondary': '🔵辅助', 'trial': '🟡试探', 'watchonly': '👀观察', 'disabled': '⛔禁用'}[role]
         print(f"    {s}: {icon}")
 
     print()
-    print("  ── 板块淘汰线 ──")
+    print("  ── 板块准入线 ──")
     for s, cutoff in config['sector_cutoff'].items():
         if cutoff is not None:
-            print(f"    {s}: 后{int(cutoff*100)}%淘汰")
+            print(f"    {s}: 强度分位≥{cutoff:.2f}（约前{int((1-cutoff)*100)}%）")
         else:
-            print(f"    {s}: —（该策略禁用）")
+            role = config['strategies'].get(s, 'disabled')
+            if role == 'trial':
+                print(f"    {s}: —（试探策略由筛选器按模式使用默认强板块线）")
+            else:
+                print(f"    {s}: —（该策略禁用）")
 
     print()
     print("  ── S3 X2阈值 ──")
@@ -315,8 +394,7 @@ def _print_report(mode, config, details):
     print("  ── 附加规则 ──")
     print("    · 同行业硬性只推1只（最高分）")
     print("    · 同板块取5日涨幅TOP3")
-    if mode == 'M3':
-        print("    · S1通过的票标注为「观察池」，不下单")
+    print("    · 非主力试探策略只允许A级候选，仓位按V8表缩小")
     print()
 
 
@@ -325,7 +403,7 @@ def get_mode_params():
     静默返回模式参数字典，供 offline_screener.py 调用
     返回 dict:
       mode: str ('M1'-'M5')
-      strategies: dict  (S1/S2/S3 → 'primary'/'secondary'/'watchonly'/'disabled')
+    strategies: dict  (S1/S2/S3 → 'primary'/'secondary'/'trial'/'watchonly'/'disabled')
       sector_cutoff: dict (S1/S2/S3 → float or None)
       s3_x2_limit: int
       s3_x2_relax: dict or None
@@ -345,6 +423,7 @@ def get_mode_params():
         'position_modifier': details.get('position_modifier', 1.0),
         'cycle_warning': details.get('cycle_warning', ''),
         'sector_rotation': details.get('cycle_data', {}).get('sector_rotation', {}),
+        'freshness': details.get('freshness', {}),
     }
 
 

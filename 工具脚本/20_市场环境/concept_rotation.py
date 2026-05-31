@@ -197,6 +197,20 @@ def _build_metrics(df):
     return metrics, latest_date, all_dates
 
 
+def _latest_stock_date(conn):
+    try:
+        row = conn.execute(
+            """
+            SELECT MAX(date)
+            FROM kline_daily
+            WHERE code NOT LIKE 'sh.000%' AND code NOT LIKE 'sz.399%'
+            """
+        ).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
 def _latest_stock_window(conn, end_date, window=6):
     rows = conn.execute(
         "SELECT DISTINCT date FROM kline_daily WHERE code='sh.000001' AND date <= ? ORDER BY date DESC LIMIT %s",
@@ -309,8 +323,11 @@ def analyze_concepts(days=120, top=20, as_of=None, source='auto'):
         conn.close()
         return {'error': '概念历史数据不足，至少需要5个交易日'}
 
+    stock_latest = _latest_stock_date(conn)
     result = {
         'latest_date': latest_date,
+        'stock_latest_date': stock_latest,
+        'is_stale': bool(stock_latest and latest_date < stock_latest),
         'date_count': len(all_dates),
         'concept_count': len(metrics),
         'top': metrics[:top],
@@ -356,11 +373,14 @@ def main():
     mainline = [m for m in metrics if m['stage'] == '主线']
     climax = [m for m in metrics if m['stage'] == '高潮谨慎']
     falling = sorted([m for m in metrics if m['stage'] == '退潮回避'], key=lambda x: x['score'])
+    stock_latest = _latest_stock_date(conn)
 
     print("=" * 80)
     print("  概念主线与轮动雷达")
     print("=" * 80)
     print(f"  数据源: {SOURCE}  数据日期: {latest_date}  统计交易日: {len(all_dates)}  概念数: {len(metrics)}")
+    if stock_latest and latest_date < stock_latest:
+        print(f"  ⚠️ 概念数据滞后：概念最新{latest_date}，个股最新{stock_latest}。盘中/收盘分析前请先运行 _fetch_concept_data.py。")
     print(f"  分析口径: 今天强度 + 3/5/20日趋势 + 排名变化 + 量能放大 + 节奏标签")
 
     _print_section("主线/强势概念 TOP", top_items, conn, latest_date, args.top)
