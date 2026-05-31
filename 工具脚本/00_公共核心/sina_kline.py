@@ -15,6 +15,8 @@
 import requests
 import pandas as pd
 
+_HEADERS = {"User-Agent": "Mozilla/5.0"}
+
 _SINA_URL = (
     "http://money.finance.sina.com.cn/quotes_service/api/json_v2.php"
     "/CN_MarketData.getKLineData"
@@ -48,7 +50,8 @@ def fetch_kline(bs_code: str, days: int = 150) -> pd.DataFrame:
     # 多拉 1 条，用于计算第一条记录的 pctChg
     n = days + 1
     try:
-        resp = requests.get(_SINA_URL.format(code=sina_code, n=n), timeout=15)
+        resp = requests.get(_SINA_URL.format(code=sina_code, n=n), headers=_HEADERS, timeout=15)
+        resp.raise_for_status()
         raw = resp.json()
     except Exception:
         return pd.DataFrame()

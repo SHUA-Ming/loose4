@@ -4,7 +4,7 @@
 概念板块数据采集脚本
 
 功能：
-    1. 从 akshare 获取概念列表 → concept_info（优先东方财富，失败切同花顺）
+    1. 从 akshare 获取概念列表 → concept_info（默认同花顺，东财可手动指定）
   2. 获取概念近一年或近期日K → concept_daily
   3. 获取概念当前成分股 → concept_member
 
@@ -13,7 +13,7 @@
   python _fetch_concept_data.py --full --days 365 # 首次全量，补近一年并刷新成分股
     python _fetch_concept_data.py --skip-members    # 只补概念日K，不刷新成分股
     python _fetch_concept_data.py --members-only    # 只刷新概念成分股（同花顺默认每概念最多前50个）
-    python _fetch_concept_data.py --source ths      # 指定同花顺兜底源
+    python _fetch_concept_data.py --source eastmoney # 手动使用东方财富源
   python _fetch_concept_data.py --limit 20        # 调试：只更新前20个概念
 """
 import argparse
@@ -269,7 +269,7 @@ def main():
     parser = argparse.ArgumentParser(description='更新概念板块数据')
     parser.add_argument('--full', action='store_true', help='全量模式，按 --days 拉取历史')
     parser.add_argument('--days', type=int, default=30, help='拉取最近多少个自然日，--full 建议 365')
-    parser.add_argument('--source', choices=['auto', 'eastmoney', 'ths'], default='auto', help='数据源：默认东财失败后切同花顺')
+    parser.add_argument('--source', choices=['auto', 'eastmoney', 'ths'], default='ths', help='数据源：默认同花顺；auto 会先试东财再切同花顺')
     parser.add_argument('--limit', type=int, default=0, help='调试用：只更新前N个概念')
     parser.add_argument('--skip-members', action='store_true', help='跳过概念成分股刷新')
     parser.add_argument('--members-only', action='store_true', help='只刷新概念成分股，跳过概念日K')
