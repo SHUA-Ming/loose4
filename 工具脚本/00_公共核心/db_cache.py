@@ -27,10 +27,10 @@ import pandas as pd
 
 # MySQL 连接配置
 MYSQL_CONFIG = {
-    'host': 'localhost',
+    'host': '127.0.0.1',
     'port': 3306,
     'user': 'root',
-    'password': '1807184925m',
+    'password': '123456',
     'database': 'stock_local',
     'charset': 'utf8mb4',
     'autocommit': False,
@@ -38,7 +38,7 @@ MYSQL_CONFIG = {
 }
 
 # 向后兼容别名（原 SQLite 路径，现已废弃，保留避免 ImportError）
-DB_PATH = 'mysql://root@localhost:3306/stock_local'
+DB_PATH = 'mysql://root@127.0.0.1:3306/stock_local'
 
 KLINE_COLS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'turn', 'pctChg']
 NUMERIC_COLS = ['open', 'high', 'low', 'close', 'volume', 'amount', 'turn', 'pctChg']
@@ -138,9 +138,31 @@ class _MysqlCompatConn:
         self._conn.close()
 
 
-def get_connection():
-    """获取数据库连接（返回 MySQL 兼容包装器，接口与 sqlite3.Connection 一致）"""
-    conn = mysql.connector.connect(**MYSQL_CONFIG)
+# 会话级锁等待上限（秒）。服务器默认被设成 31536000(365天)，
+# 一旦只读长事务挡住 DDL，等待方会"卡死一年"。统一压到 60 秒快速失败。
+SESSION_LOCK_WAIT_TIMEOUT = 60
+
+
+def get_connection(readonly=False):
+    """获取数据库连接（返回 MySQL 兼容包装器，接口与 sqlite3.Connection 一致）。
+
+    readonly=True：开 autocommit，每条 SELECT 立即结束事务，不积累 MDL，
+    避免只读脚本（选股/分析）的长事务把后续 DDL 卡死。纯查询脚本一律传 True。
+    """
+    config = dict(MYSQL_CONFIG)
+    if readonly:
+        config['autocommit'] = True
+    conn = mysql.connector.connect(**config)
+    # 护栏：无论服务器全局怎么设，本会话锁等待都不超过 60 秒，宁可报错也不挂死。
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SET SESSION lock_wait_timeout = {SESSION_LOCK_WAIT_TIMEOUT}")
+        cur.execute(f"SET SESSION innodb_lock_wait_timeout = {min(SESSION_LOCK_WAIT_TIMEOUT, 50)}")
+        cur.close()
+        if not readonly:
+            conn.commit()
+    except Exception:
+        pass
     return _MysqlCompatConn(conn)
 
 

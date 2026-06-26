@@ -33,6 +33,11 @@ try:
     from concept_rotation import analyze_concepts
 except Exception:
     analyze_concepts = None
+try:
+    from theme_family import code_to_family, analyze_families
+except Exception:
+    code_to_family = None
+    analyze_families = None
 import pandas as pd
 import numpy as np
 
@@ -52,18 +57,16 @@ if rot.get('falling'):
     print(f"  >>> 🔻 退潮板块: {', '.join(s['industry'][:8] for s in rot['falling'][:3])}")
 print()
 
-init_db()
-conn = get_connection()
+conn = get_connection(readonly=True)  # 纯查询脚本：只读连接，不开长事务、不建表
 
 # ═══ 历史数据驱动的入场/止盈/止损计算 ═══
 
 def _load_chip(code, price):
-    """加载筹码数据，返回 chip_result 或 None"""
+    """加载筹码数据，返回 chip_result 或 None。筹码分布需全历史，走 _get_kline_full（按需查库+缓存）。"""
     try:
-        chip_df = pd.read_sql('SELECT * FROM kline_daily WHERE code=? ORDER BY date', conn, params=[code])
-        for col in ['open','high','low','close','volume','amount','turn','pctChg']:
-            chip_df[col] = pd.to_numeric(chip_df[col], errors='coerce')
-        chip_df = chip_df.dropna(subset=['close','volume'])
+        chip_df = _get_kline_full(code)  # 全历史，已数值化、dropna
+        if chip_df.empty:
+            return None
         return analyze_chip_cost(chip_df, current_price=price)
     except Exception:
         return None
@@ -284,6 +287,58 @@ def _print_chip(chip):
 
 codes = [r[0] for r in conn.execute('SELECT DISTINCT code FROM kline_daily').fetchall()]
 
+# ═══ 性能优化：K线分两级加载 ═══
+# 扫描（S1~S4 的 [-60:] 等计算）只需近端数据 → 一次性读近 300 天入内存(~7s)，按 code 切片复用；
+# 筹码分析（analyze_chip_cost）需要全历史的衰减分布 → 仅对进入分析的候选(~数十只)按需查全量并缓存。
+# 原实现是四策略各自逐股全量查询(3205×4 趟)，已废弃。
+import datetime as _dt
+print("  >>> 加载近端K线到内存 ...", flush=True)
+_kl_max_date = conn.execute('SELECT MAX(date) FROM kline_daily').fetchone()[0]
+_kl_cutoff = (_dt.date.fromisoformat(str(_kl_max_date)) - _dt.timedelta(days=300)).isoformat()
+# FORCE INDEX(PRIMARY)：钉死走主键顺序扫描，避免优化器在某些 cutoff 改走 idx_kline_date+filesort(实测会慢到 40s+)。
+# 窗口取 300 天（≈200 交易日，远超扫描所需 60 根），且实测对"停牌复牌不足60根"的边界股零偏差。
+_kl_all = pd.read_sql(
+    'SELECT * FROM kline_daily FORCE INDEX(PRIMARY) WHERE date>=%s ORDER BY code, date',
+    conn._conn, params=[_kl_cutoff]
+)
+if 'date' in _kl_all.columns:
+    _kl_all['date'] = _kl_all['date'].astype(str)
+for _c in ['open','high','low','close','volume','amount','turn','pctChg']:
+    if _c in _kl_all.columns:
+        _kl_all[_c] = pd.to_numeric(_kl_all[_c], errors='coerce')
+KLINE_BY_CODE = {code: grp.reset_index(drop=True) for code, grp in _kl_all.groupby('code', sort=False)}
+del _kl_all
+print(f"  >>> 近端K线缓存就绪：{len(KLINE_BY_CODE)} 只股票（近300日）\n", flush=True)
+
+_FULL_KLINE_CACHE = {}  # code → 全历史(已数值化、dropna)，供筹码分析按需使用
+
+
+def _get_kline(code):
+    """从内存缓存取单只股票近端K线（已数值化、按日期升序）。返回副本避免下游 dropna/赋值污染缓存。"""
+    df = KLINE_BY_CODE.get(code)
+    if df is None:
+        return pd.DataFrame()
+    return df.copy()
+
+
+def _get_kline_full(code):
+    """取单只股票全历史K线（已数值化、dropna），按需查库并进程内缓存。筹码衰减分布需要全量，不能用近端窗口。"""
+    cached = _FULL_KLINE_CACHE.get(code)
+    if cached is not None:
+        return cached
+    try:
+        df = pd.read_sql('SELECT * FROM kline_daily WHERE code=%s ORDER BY date', conn._conn, params=[code])
+        if 'date' in df.columns:
+            df['date'] = df['date'].astype(str)
+        for _c in ['open','high','low','close','volume','amount','turn','pctChg']:
+            if _c in df.columns:
+                df[_c] = pd.to_numeric(df[_c], errors='coerce')
+        df = df.dropna(subset=['close','volume']).reset_index(drop=True)
+    except Exception:
+        df = pd.DataFrame()
+    _FULL_KLINE_CACHE[code] = df
+    return df
+
 # === 加载行业映射和板块数据 ===
 industry_map = {}
 sector_momentum = {}  # industry → 5日动量
@@ -439,6 +494,47 @@ def _load_concept_stage_by_code():
 
 concept_stage_by_code = _load_concept_stage_by_code()
 
+# === 产业链主线家族加成（V11）：持续主线家族成员即便今日回调也优先 ===
+FAMILY_STATUS_BONUS = {'持续主线': 2, '阶段主线': 1}
+
+
+def _merge_family_into_concept_stage():
+    """把产业链家族持续性叠加到概念加权：
+    - 持续主线家族成员 +2，阶段主线家族成员 +1（与概念阶段加成合并，正向封顶+3）
+    - 半导体链这类今日回调但20日持续的主线，成员股不会因今日弱而被埋没。
+    """
+    if code_to_family is None:
+        print("  产业链家族: theme_family.py 不可导入，跳过家族加成")
+        return
+    try:
+        fam_by_code, ferr = code_to_family()
+    except Exception as exc:
+        print(f"  产业链家族加载失败: {exc}")
+        return
+    if ferr:
+        print(f"  产业链家族: {ferr}")
+        return
+    if not fam_by_code:
+        print("  产业链家族: 当前无持续/阶段主线家族")
+        return
+    fam_names = sorted({v['family'] for v in fam_by_code.values()})
+    print(f"  产业链家族: {len(fam_by_code)} 只股票归入主线家族 [{ '、'.join(fam_names) }]")
+    for code, fam in fam_by_code.items():
+        fam_bonus = FAMILY_STATUS_BONUS.get(fam['family_status'], 0)
+        meta = concept_stage_by_code.get(code)
+        if meta is None:
+            meta = {'concept_name': '', 'concept_stage': '—', 'concept_bonus': 0, 'concept_score': 0}
+            concept_stage_by_code[code] = meta
+        meta['family'] = fam['family']
+        meta['family_status'] = fam['family_status']
+        meta['family_active_days20'] = fam['family_active_days20']
+        meta['family_leader_concept'] = fam['family_leader_concept']
+        # 与概念阶段加成合并，正向封顶 +3，避免单一方向权重过大
+        meta['concept_bonus'] = min(meta.get('concept_bonus', 0) + fam_bonus, 3)
+
+
+_merge_family_into_concept_stage()
+
 
 def _concept_meta(code):
     return concept_stage_by_code.get(code, {
@@ -446,6 +542,10 @@ def _concept_meta(code):
         'concept_stage': '—',
         'concept_bonus': 0,
         'concept_score': 0,
+        'family': '',
+        'family_status': '',
+        'family_active_days20': 0,
+        'family_leader_concept': '',
     })
 
 
@@ -457,12 +557,10 @@ print("=" * 80)
 print("  大盘环境速览 (缓存数据)")
 print("=" * 80)
 for idx_code, idx_name in [('sh.000001','上证指数'),('sz.399001','深证成指'),('sz.399006','创业板指')]:
-    df = pd.read_sql('SELECT * FROM kline_daily WHERE code=? ORDER BY date', conn, params=[idx_code])
+    df = _get_kline(idx_code)
     if df.empty:
         print(f"  {idx_name}: 无缓存数据")
         continue
-    for c in ['open','high','low','close','volume','pctChg']:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
     cls = df['close'].values
     pcts = df['pctChg'].values
     last_date = df['date'].iloc[-1]
@@ -511,11 +609,9 @@ results = []
 for code in (codes if s1_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
-    df = pd.read_sql('SELECT * FROM kline_daily WHERE code=? ORDER BY date', conn, params=[code])
+    df = _get_kline(code)
     if len(df) < 60:
         continue
-    for c in ['open','high','low','close','volume','amount','turn','pctChg']:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
     df = df.dropna(subset=['close','volume'])
     if len(df) < 60:
         continue
@@ -605,7 +701,7 @@ for code in (codes if s1_role != 'disabled' else []):
         continue
 
     try:
-        chip_for_score = analyze_chip_cost(df, current_price=last)
+        chip_for_score = analyze_chip_cost(_get_kline_full(code), current_price=last)
     except Exception:
         chip_for_score = None
     if chip_for_score and chip_for_score.get('resistance_zone'):
@@ -792,11 +888,9 @@ s2_results = []
 for code in (codes if s2_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
-    df = pd.read_sql('SELECT * FROM kline_daily WHERE code=? ORDER BY date', conn, params=[code])
+    df = _get_kline(code)
     if len(df) < 60:
         continue
-    for c in ['open','high','low','close','volume','amount','turn','pctChg']:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
     df = df.dropna(subset=['close','volume'])
     if len(df) < 60:
         continue
@@ -1000,11 +1094,9 @@ s3_results = []
 for code in (codes if s3_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
-    df = pd.read_sql('SELECT * FROM kline_daily WHERE code=? ORDER BY date', conn, params=[code])
+    df = _get_kline(code)
     if len(df) < 60:
         continue
-    for c in ['open','high','low','close','volume','amount','turn','pctChg']:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
     df = df.dropna(subset=['close','volume'])
     if len(df) < 60:
         continue
@@ -1177,11 +1269,9 @@ s4_results = []
 for code in (codes if s4_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
-    df = pd.read_sql('SELECT * FROM kline_daily WHERE code=? ORDER BY date', conn, params=[code])
+    df = _get_kline(code)
     if len(df) < 60:
         continue
-    for c in ['open','high','low','close','volume','amount','turn','pctChg']:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
     df = df.dropna(subset=['close','volume'])
     if len(df) < 60:
         continue
@@ -1429,7 +1519,9 @@ if dedup_results:
         concept_text = c.get('concept_stage', '—')
         if c.get('concept_name'):
             concept_text = f"{concept_text}:{c['concept_name'][:6]}"
-        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {ind_short:>12s}{rot_tag} {concept_text:>10s}  {advice}")
+        fam = c.get('family', '')
+        fam_tag = f" 〔{fam}·{c.get('family_status','')}{c.get('family_active_days20',0)}/20〕" if fam else ''
+        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {ind_short:>12s}{rot_tag} {concept_text:>10s}{fam_tag}  {advice}")
 else:
     print("\n  （无最终推荐候选）")
 

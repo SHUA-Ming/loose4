@@ -1,0 +1,17 @@
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / 编辑器临时文件
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 临时实验脚本（项目结构规则约定：任务结束应删除）
+**/_tmp_*.py
+**/_temp_*.py
+**/_check_*.py
+**/_backtest_*.py

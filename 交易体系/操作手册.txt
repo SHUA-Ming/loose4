@@ -257,7 +257,7 @@
     回测验证：板块过滤使3个月收益从+0.53%提升到+1.58%，回撤从-3.92%降到-2.68%
 
 第3步：个股筛选
-    工具：python auto_screener.py / batch_fetch.py
+    工具：python 工具脚本/30_候选短股/offline_screener.py / 工具脚本/10_数据更新/batch_fetch.py
     对照：选股参数手册逐项打分
     决策：
         · 前置条件F1-F5必须通过≥4项

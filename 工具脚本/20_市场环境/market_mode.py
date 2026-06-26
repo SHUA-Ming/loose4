@@ -145,13 +145,24 @@ def _check_data_freshness(conn, index_data):
     }
 
 
+_MODE_CACHE = None  # 进程级缓存：一次运行内市场模式只算一次
+
+
 def detect_market_mode(verbose=True):
     """
     检测当前市场模式，返回 (mode_key, mode_config, details_dict)
     details_dict 包含三大指数的情绪、趋势等中间数据
     """
-    init_db()
-    conn = get_connection()
+    global _MODE_CACHE
+    if _MODE_CACHE is not None:
+        mode, config, details = _MODE_CACHE
+        if verbose:
+            compute_sentiment(verbose=True)  # 命中缓存(内部亦缓存)，仅补打印
+            print()
+            _print_report(mode, config, details)
+        return _MODE_CACHE
+
+    conn = get_connection(readonly=True)  # 纯分析：只读连接，不建表
 
     index_data = {}
     emotions = []
@@ -304,6 +315,7 @@ def detect_market_mode(verbose=True):
     else:
         sentiment_result = None
 
+    _MODE_CACHE = (mode, config, details)
     return mode, config, details
 
 

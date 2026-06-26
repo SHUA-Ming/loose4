@@ -27,7 +27,9 @@ import pandas as pd
 import numpy as np
 from collections import defaultdict
 
-init_db()
+
+
+_SENTIMENT_CACHE = None  # 进程级缓存：一次运行内市场情绪只算一次
 
 
 def compute_sentiment(verbose=True):
@@ -45,7 +47,14 @@ def compute_sentiment(verbose=True):
       cycle_score: int — 周期量化得分
       sector_rotation: dict — 板块轮动信息
     """
-    conn = get_connection()
+    global _SENTIMENT_CACHE
+    if _SENTIMENT_CACHE is not None:
+        # 同一进程内已算过：直接复用，verbose 时仍补打印报告
+        if verbose:
+            _print_report(_SENTIMENT_CACHE)
+        return _SENTIMENT_CACHE
+
+    conn = get_connection(readonly=True)  # 纯分析：只读连接，不建表
 
     # 获取最近20个交易日
     dates = [r[0] for r in conn.execute(
@@ -68,12 +77,20 @@ def compute_sentiment(verbose=True):
     limit_up_codes = {} # 涨停股票代码集合
     big_gain = {}       # 涨幅>5%家数
 
+    # 一次性取回近20日全部 (code, date, pctChg)，按日分组在内存里统计，
+    # 避免对 dates 逐日发查询（每条 WHERE date=? 都是一次往返）。
+    _all_rows = conn.execute(
+        "SELECT code, date, pctChg FROM kline_daily WHERE date>=? AND pctChg IS NOT NULL",
+        [dates[0]]
+    ).fetchall()
+    _by_date = {}
+    for _code, _d, _p in _all_rows:
+        if _d in _by_date:
+            _by_date[_d][_code] = _p
+        else:
+            _by_date[_d] = {_code: _p}
     for d in dates:
-        rows = conn.execute(
-            "SELECT code, pctChg FROM kline_daily WHERE date=? AND pctChg IS NOT NULL",
-            [d]
-        ).fetchall()
-        codes_pct = {r[0]: r[1] for r in rows}
+        codes_pct = _by_date.get(d, {})
         total_count[d] = len(codes_pct)
         limit_up[d] = sum(1 for p in codes_pct.values() if p >= 9.5)
         limit_down[d] = sum(1 for p in codes_pct.values() if p <= -9.5)
@@ -99,12 +116,9 @@ def compute_sentiment(verbose=True):
             yesterday_lt_today[today] = {'count': 0, 'avg_pct': 0, 'up_ratio': 0, 'limit_again': 0}
             continue
 
-        today_pcts = conn.execute(
-            f"SELECT code, pctChg FROM kline_daily WHERE date=? AND code IN ({','.join('?' * len(yt_codes))})",
-            [today] + list(yt_codes)
-        ).fetchall()
-
-        pcts = [r[1] for r in today_pcts if r[1] is not None]
+        # 昨日涨停股今日涨跌：直接从已加载的 _by_date 取，不再发查询
+        _today_map = _by_date.get(today, {})
+        pcts = [_today_map[c] for c in yt_codes if c in _today_map and _today_map[c] is not None]
         if pcts:
             yesterday_lt_today[today] = {
                 'count': len(yt_codes),          # 昨日涨停数
@@ -166,6 +180,7 @@ def compute_sentiment(verbose=True):
     if verbose:
         _print_report(result)
 
+    _SENTIMENT_CACHE = result
     return result
 
 

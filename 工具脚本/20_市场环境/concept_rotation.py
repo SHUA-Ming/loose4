@@ -84,6 +84,25 @@ def _classify_stage(metric):
     return '普通轮动'
 
 
+def _classify_persistence(metric):
+    """20日持续性标签：区分“持续主线成员”与“今日偶发轮动”。
+
+    持续强势：近20日有≥50%交易日处于前20%（约≥10天）
+    阶段强势：近20日有30%~50%交易日处于前20%（约6~9天）
+    偶发轮动：今日很强（前15%）但近20日很少强（持续性<20%），属于刚轮动到的方向
+    其余返回空标签。
+    """
+    persist20 = metric.get('persist20', 0.0)
+    rank_pct_today = metric.get('rank_pct_today', 1.0)
+    if persist20 >= 0.50:
+        return '持续强势'
+    if persist20 >= 0.30:
+        return '阶段强势'
+    if rank_pct_today <= 0.15 and persist20 <= 0.20:
+        return '偶发轮动'
+    return ''
+
+
 def _score_metric(metric):
     score = 0.0
     score += max(0.0, 0.30 - metric['rank_pct_today']) / 0.30 * 25
@@ -94,6 +113,15 @@ def _score_metric(metric):
         score += min(abs(metric['rank_change5']), 50) * 0.35
     score += min(max(metric['amount_ratio'] - 1, 0.0), 2.0) * 8
     score += metric['strong_days5'] * 2
+    # 20日持续性加权：奖励持续主线成员，抑制今日偶发轮动
+    score += metric.get('top_days20', 0) * 1.2
+    persist_tag = metric.get('persist_tag', '')
+    if persist_tag == '持续强势':
+        score += 8
+    elif persist_tag == '阶段强势':
+        score += 4
+    elif persist_tag == '偶发轮动':
+        score -= 6
     if metric['stage'] == '主线分歧':
         score += 8
     elif metric['stage'] == '退潮回避':
@@ -131,12 +159,13 @@ def _resolve_source(conn, requested_source):
     return 'eastmoney'
 
 
-def _build_metrics(df):
-    latest_date = df['date'].max()
-    all_dates = sorted(df['date'].unique())
-    if len(all_dates) < 5:
-        return [], latest_date, all_dates
+def _compute_daily_ranks(df):
+    """按日把概念按当日涨幅排名，返回 (daily_rank, daily_count)。
 
+    daily_rank[(concept_name, date)] = 名次(1=最强)
+    daily_count[date]                = 当日参与排名的概念数
+    供 _build_metrics 和 theme_family.py 复用，避免重复实现排名口径。
+    """
     daily_rank = {}
     daily_count = {}
     for date_val, grp in df.groupby('date'):
@@ -144,6 +173,16 @@ def _build_metrics(df):
         daily_count[date_val] = len(grp)
         for idx, row in grp.iterrows():
             daily_rank[(row['concept_name'], date_val)] = idx + 1
+    return daily_rank, daily_count
+
+
+def _build_metrics(df):
+    latest_date = df['date'].max()
+    all_dates = sorted(df['date'].unique())
+    if len(all_dates) < 5:
+        return [], latest_date, all_dates
+
+    daily_rank, daily_count = _compute_daily_ranks(df)
 
     metrics = []
     for concept_name, grp in df.groupby('concept_name'):
@@ -165,6 +204,16 @@ def _build_metrics(df):
         rank_change5 = ranks5[-1] - ranks5[0]
         strong_days5 = sum(1 for r, d in zip(ranks5, recent_dates) if r / max(daily_count.get(d, 1), 1) <= 0.20)
 
+        # === 20日持续性：区分“持续主线”与“今日偶发轮动” ===
+        recent20 = dates[-20:]
+        ranks20_pct = [
+            daily_rank.get((concept_name, d), daily_count.get(d, 1)) / max(daily_count.get(d, 1), 1)
+            for d in recent20
+        ]
+        top_days20 = sum(1 for rp in ranks20_pct if rp <= 0.20)
+        avg_rank20 = float(np.mean(ranks20_pct)) if ranks20_pct else 1.0
+        persist20 = top_days20 / max(len(recent20), 1)
+
         amount5 = np.mean(amounts[-5:]) if len(amounts) >= 5 else np.mean(amounts)
         amount20 = np.mean(amounts[-20:]) if len(amounts) >= 20 else np.mean(amounts)
         amount_ratio = amount5 / amount20 if amount20 and amount20 > 0 else 1.0
@@ -181,6 +230,9 @@ def _build_metrics(df):
             'avg_rank5': float(avg_rank5),
             'rank_change5': int(rank_change5),
             'strong_days5': int(strong_days5),
+            'top_days20': int(top_days20),
+            'persist20': float(persist20),
+            'avg_rank20': float(avg_rank20),
             'pct_today': _safe_float(latest.get('pctChg')),
             'pct3': _calc_return(closes, 3),
             'pct5': _calc_return(closes, 5),
@@ -190,6 +242,7 @@ def _build_metrics(df):
             'above_ma20': bool(close_last > ma20) if ma20 and not pd.isna(ma20) else False,
         }
         metric['stage'] = _classify_stage(metric)
+        metric['persist_tag'] = _classify_persistence(metric)
         metric['score'] = _score_metric(metric)
         metrics.append(metric)
 
@@ -289,18 +342,19 @@ def _print_section(title, items, conn, latest_date, top_n, with_rule=False):
     if not items:
         print("  （暂无）")
         return
-    print(f"  {'#':>2s} {'概念':<16s} {'阶段':<8s} {'分数':>5s} {'今涨':>8s} {'3日':>8s} {'5日':>8s} {'20日':>8s} {'今排名':>7s} {'量能':>6s}  前排")
-    print("-" * 120)
+    print(f"  {'#':>2s} {'概念':<16s} {'阶段':<8s} {'持续':>6s} {'分数':>5s} {'今涨':>8s} {'3日':>8s} {'5日':>8s} {'20日':>8s} {'今排名':>7s} {'量能':>6s}  前排")
+    print("-" * 128)
     for idx, item in enumerate(items[:top_n], 1):
         leaders = _load_leaders(conn, item['concept_name'], latest_date, top_n=3)
         leader_text = '、'.join(
             f"{l['name'] or l['code']}({l['tier']},{l['chg5']:+.1f}%)" for l in leaders
         ) or '-'
+        persist_cell = f"{item.get('top_days20', 0):>2d}/20"
         print(
-            f"  {idx:>2d} {item['concept_name'][:16]:<16s} {item['stage']:<8s} {item['score']:>5.1f} "
+            f"  {idx:>2d} {item['concept_name'][:16]:<16s} {item['stage']:<8s} {persist_cell:>6s} {item['score']:>5.1f} "
             f"{_fmt_pct(item['pct_today']):>8s} {_fmt_pct(item['pct3']):>8s} {_fmt_pct(item['pct5']):>8s} {_fmt_pct(item['pct20']):>8s} "
             f"{item['rank_today']:>3d}/{item['total_today']:<3d} "
-            f"{item['amount_ratio']:>5.2f}x  {leader_text}"
+            f"{item['amount_ratio']:>5.2f}x  {('['+item['persist_tag']+'] ') if item.get('persist_tag') else ''}{leader_text}"
         )
     if with_rule:
         print()
@@ -309,8 +363,8 @@ def _print_section(title, items, conn, latest_date, top_n, with_rule=False):
 
 def analyze_concepts(days=120, top=20, as_of=None, source='auto'):
     global SOURCE
-    init_db()
-    conn = get_connection()
+    # 纯分析函数：不建表（建表是数据更新脚本的职责）。只读连接，不开长事务、不卡 DDL。
+    conn = get_connection(readonly=True)
     SOURCE = _resolve_source(conn, source)
     end_date = as_of
     start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
@@ -336,6 +390,10 @@ def analyze_concepts(days=120, top=20, as_of=None, source='auto'):
         'emerging': [m for m in metrics if m['stage'] == '新晋发酵'],
         'climax': [m for m in metrics if m['stage'] == '高潮谨慎'],
         'falling': sorted([m for m in metrics if m['stage'] == '退潮回避'], key=lambda x: x['score']),
+        'persistent': sorted(
+            [m for m in metrics if m['persist_tag'] in ('持续强势', '阶段强势')],
+            key=lambda x: (x['persist20'], x['score']), reverse=True),
+        'oneday': [m for m in metrics if m['persist_tag'] == '偶发轮动'],
     }
     conn.close()
     return result
@@ -350,8 +408,7 @@ def main():
     parser.add_argument('--source', choices=['auto', 'eastmoney', 'ths'], default='auto', help='概念数据源，默认自动选择最新可用源')
     args = parser.parse_args()
 
-    init_db()
-    conn = get_connection()
+    conn = get_connection(readonly=True)  # 纯分析 CLI：只读连接，不建表
     SOURCE = _resolve_source(conn, args.source)
     start_date = (datetime.now() - timedelta(days=args.days)).strftime('%Y-%m-%d')
     df = _load_concept_daily(conn, start_date, end_date=args.as_of)
@@ -373,6 +430,11 @@ def main():
     mainline = [m for m in metrics if m['stage'] == '主线']
     climax = [m for m in metrics if m['stage'] == '高潮谨慎']
     falling = sorted([m for m in metrics if m['stage'] == '退潮回避'], key=lambda x: x['score'])
+    persistent = sorted(
+        [m for m in metrics if m['persist_tag'] in ('持续强势', '阶段强势')],
+        key=lambda x: (x['persist20'], x['score']), reverse=True)
+    oneday = sorted([m for m in metrics if m['persist_tag'] == '偶发轮动'],
+                    key=lambda x: x['rank_pct_today'])
     stock_latest = _latest_stock_date(conn)
 
     print("=" * 80)
@@ -384,6 +446,8 @@ def main():
     print(f"  分析口径: 今天强度 + 3/5/20日趋势 + 排名变化 + 量能放大 + 节奏标签")
 
     _print_section("主线/强势概念 TOP", top_items, conn, latest_date, args.top)
+    _print_section("持续主线概念(20日持续性强)", persistent, conn, latest_date, min(args.top, 12), with_rule=False)
+    _print_section("今日偶发轮动(强但不持续，慎追)", oneday, conn, latest_date, min(args.top, 10))
     _print_section("分歧低吸观察池", divergence, conn, latest_date, min(args.top, 10), with_rule=True)
     _print_section("新晋发酵概念", emerging, conn, latest_date, min(args.top, 10))
     _print_section("稳定主线概念", mainline, conn, latest_date, min(args.top, 10))
@@ -394,11 +458,11 @@ def main():
     print("=" * 80)
     print("  今日使用方式")
     print("=" * 80)
-    print("  1. 先看是否有稳定主线；没有主线时降低交易频率。")
-    print("  2. 主线分歧只看龙头/前排低吸，不吸后排补涨。")
-    print("  3. 新晋发酵可小仓试错，必须等板块内多股同步。")
-    print("  4. 高潮概念只做持仓止盈，不追新仓。")
-    print("  5. 退潮概念即使个股形态好，也降级观察或回避。")
+    print("  1. 先看“持续主线概念”：20日持续性强的方向才是产业链主线，回调日也优先在这里找票。")
+    print("  2. “今日偶发轮动”是刚轮到的方向，持续性差，只做快进快出或直接回避，不当主线长拿。")
+    print("  3. 主线分歧只看龙头/前排低吸，不吸后排补涨。")
+    print("  4. 新晋发酵可小仓试错，必须等板块内多股同步。")
+    print("  5. 高潮概念只做持仓止盈，不追新仓；退潮概念即使形态好也降级或回避。")
     print("=" * 80)
     conn.close()
     return 0
