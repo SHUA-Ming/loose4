@@ -29,17 +29,18 @@ ensure_tool_paths()
 from db_cache import get_connection, init_db
 from market_mode import get_mode_params, detect_market_mode
 from chip_cost import analyze_chip_cost, chip_entry_check
-try:
-    from concept_rotation import analyze_concepts
-except Exception:
-    analyze_concepts = None
-try:
-    from theme_family import code_to_family, analyze_families
-except Exception:
-    code_to_family = None
-    analyze_families = None
+# V12: concept_rotation/theme_family 已弃用（个股加成改走 stock_industry 行业轮动，不再依赖 concept_member）
 import pandas as pd
 import numpy as np
+
+
+def _limit_up_threshold(code):
+    """涨停判定阈值(%)：主板±10%→9.5；创业板(sz.30)/科创板(sh.68)±20%→19.0。
+    用于统计近N日涨停次数，避免把创/科的普通大涨误计为涨停。"""
+    c = str(code)
+    if c.startswith('sz.30') or c.startswith('sh.68'):
+        return 19.0
+    return 9.5
 
 # ═══ V6: 先判定市场模式 ═══
 mode_key, mode_cfg, mode_details = detect_market_mode(verbose=True)
@@ -141,9 +142,19 @@ def _compute_plan(strategy, c, chip, mode):
         if sz and sz[1] >= base_lo:
             entry_basis += f" 筹码支撑{sz[0]:.2f}~{sz[1]:.2f}托底"
     elif strategy == 'S4':
-        entry_lo = max(price * 0.98, c['ma5'] * 0.995)
-        entry_hi = min(price * 1.01, c['ma5'] * 1.05)
-        entry_basis = "主线趋势跟随区(MA5上方0~5%，不等缩量)"
+        # 回踩买入区固定锚在 MA5+0~5%，不随现价漂移(现价远离MA5时旧算法会区间倒挂)
+        zone_lo = c['ma5'] * 0.995   # MA5 附近
+        zone_hi = c['ma5'] * 1.05    # MA5 上方 5%
+        if price <= zone_hi:
+            # 现价已在回踩区内 → 以现价为中心的可买区，夹在 MA5+0~5% 内
+            entry_lo = max(price * 0.98, zone_lo)
+            entry_hi = min(price * 1.01, zone_hi)
+            entry_basis = "主线趋势跟随区(MA5上方0~5%，不等缩量)"
+        else:
+            # 现价高于 MA5+5% → 等回踩到 MA5+0~5% 固定区间
+            entry_lo = zone_lo
+            entry_hi = zone_hi
+            entry_basis = f"等回踩MA5上方0~5%区({zone_lo:.2f}~{zone_hi:.2f})，现价+{(price/c['ma5']-1)*100:.1f}%偏离勿追"
     else:  # S3
         entry_lo = price * 0.985
         entry_hi = price * 1.015
@@ -306,7 +317,10 @@ if 'date' in _kl_all.columns:
 for _c in ['open','high','low','close','volume','amount','turn','pctChg']:
     if _c in _kl_all.columns:
         _kl_all[_c] = pd.to_numeric(_kl_all[_c], errors='coerce')
-KLINE_BY_CODE = {code: grp.reset_index(drop=True) for code, grp in _kl_all.groupby('code', sort=False)}
+# 预清洗一次：dropna(close/volume) 在加载期按 code 完成，避免 S1~S4 四策略主循环各自逐股 dropna
+# （原实现：12772 次 dropna ≈ 累计 15s；现合并为加载期一次 groupby 内 dropna）
+KLINE_BY_CODE = {code: grp.dropna(subset=['close', 'volume']).reset_index(drop=True)
+                 for code, grp in _kl_all.groupby('code', sort=False)}
 del _kl_all
 print(f"  >>> 近端K线缓存就绪：{len(KLINE_BY_CODE)} 只股票（近300日）\n", flush=True)
 
@@ -314,11 +328,13 @@ _FULL_KLINE_CACHE = {}  # code → 全历史(已数值化、dropna)，供筹码�
 
 
 def _get_kline(code):
-    """从内存缓存取单只股票近端K线（已数值化、按日期升序）。返回副本避免下游 dropna/赋值污染缓存。"""
+    """从内存缓存取单只股票近端K线（已在加载期数值化+dropna，按日期升序）。
+    返回缓存引用，调用方只读（全部走 df['col'].values 取值，不原地改）——省去原每股 .copy()（×12820）。
+    如需修改请自行 .copy()。"""
     df = KLINE_BY_CODE.get(code)
     if df is None:
         return pd.DataFrame()
-    return df.copy()
+    return df
 
 
 def _get_kline_full(code):
@@ -424,117 +440,61 @@ for s in rot.get('rising', []):
 for s in rot.get('falling', []):
     rotation_falling.add(s.get('industry', ''))
 
-# === V9: 概念主线阶段映射 ===
-CONCEPT_STAGE_BONUS = {
-    '主线': 2,
-    '主线分歧': 1,
-    '新晋发酵': 1,
-    '强势观察': 0,
-    '普通轮动': 0,
-    '高潮谨慎': -2,
-    '退潮回避': -3,
-}
-CONCEPT_HARD_EXCLUDE = {'退潮回避'}
+# === V12: 板块归属退化为行业轮动（弃 concept_member，改走可靠的 sector_daily 行业强度）===
+# 个股加成不再依赖稀疏/脏的 concept_member，改由所属行业的轮动强度推导。
+# 行业轮动信号 = market_mode 的 sector_rotation(rotation_rising/falling) + 本脚本 sector_rank(5日动量分位)。
+CONCEPT_HARD_EXCLUDE = set()  # 行业模式不按概念阶段硬排除；退潮由 rot_bonus -1 体现
 
 
-def _load_concept_stage_by_code():
-    """返回 code → 最优概念阶段，用于候选加权/降级。"""
-    if analyze_concepts is None:
-        print("  概念阶段: concept_rotation.py 不可导入，跳过概念加权")
-        return {}
+def _industry_stage_bonus(ind):
+    """按行业轮动强度返回 (stage, bonus)：持续主线+2 / 上升轮动+1 / 强势板块+1 / 退潮·普通0。"""
+    if not ind:
+        return '—', 0
+    rank = sector_rank.get(ind)
+    if ind in rotation_rising:
+        if rank is not None and rank >= 0.8:
+            return '持续主线', 2
+        return '上升轮动', 1
+    if rank is not None and rank >= 0.85:
+        return '强势板块', 1
+    if ind in rotation_falling:
+        return '退潮', 0
+    return '普通轮动', 0
+
+
+def _load_industry_stage_by_code():
+    """返回 code → 行业轮动元数据（沿用 concept_* 字段名，下游打分/输出无需改）。"""
+    meta_by_code = {}
     try:
-        concept_result = analyze_concepts(days=120, top=200, source='auto')
-        if concept_result.get('error'):
-            print(f"  概念阶段: {concept_result['error']}，跳过概念加权")
-            return {}
-        concept_stage = {}
-        for group in ('top', 'mainline', 'divergence', 'emerging', 'climax', 'falling'):
-            for item in concept_result.get(group, []):
-                name = item.get('concept_name')
-                if not name:
-                    continue
-                stage = item.get('stage', '普通轮动')
-                bonus = CONCEPT_STAGE_BONUS.get(stage, 0)
-                score = item.get('score', 0)
-                old = concept_stage.get(name)
-                if old is None or (bonus, score) > (old['bonus'], old['score']):
-                    concept_stage[name] = {'stage': stage, 'bonus': bonus, 'score': score}
-        if not concept_stage:
-            print("  概念阶段: 无可用概念阶段，跳过概念加权")
-            return {}
-        names = list(concept_stage.keys())
-        code_stage = {}
-        chunk_size = 200
-        for start_idx in range(0, len(names), chunk_size):
-            chunk = names[start_idx:start_idx + chunk_size]
-            placeholders = ','.join(['?'] * len(chunk))
-            rows = conn.execute(
-                f"SELECT concept_name, code FROM concept_member WHERE concept_name IN ({placeholders})",
-                chunk,
-            ).fetchall()
-            for concept_name, code in rows:
-                meta = concept_stage.get(concept_name)
-                if not meta:
-                    continue
-                item = {
-                    'concept_name': concept_name,
-                    'concept_stage': meta['stage'],
-                    'concept_bonus': meta['bonus'],
-                    'concept_score': meta['score'],
-                }
-                old = code_stage.get(code)
-                if old is None or (item['concept_bonus'], item['concept_score']) > (old['concept_bonus'], old['concept_score']):
-                    code_stage[code] = item
-        print(f"  概念阶段: {len(code_stage)} 只股票已映射主线/分歧/退潮标签")
-        return code_stage
+        rows = conn.execute(
+            "SELECT code, industry FROM stock_industry WHERE industry IS NOT NULL"
+        ).fetchall()
     except Exception as exc:
-        print(f"  概念阶段加载失败: {exc}")
-        return {}
+        print(f"  行业轮动: 读取 stock_industry 失败 ({exc})，跳过行业加成")
+        return meta_by_code
+    graded = 0
+    for code, ind in rows:
+        stage, bonus = _industry_stage_bonus(ind)
+        meta_by_code[code] = {
+            'concept_name': ind or '',
+            'concept_stage': stage,
+            'concept_bonus': bonus,
+            'concept_score': round(sector_rank.get(ind, 0.5) * 100, 1),
+            'family': '',
+            'family_status': '',
+            'family_active_days20': 0,
+            'family_leader_concept': '',
+        }
+        if bonus > 0:
+            graded += 1
+    print(f"  行业轮动: {len(meta_by_code)} 只股票映射行业阶段，其中 {graded} 只处上升/强势行业(加成>0)")
+    return meta_by_code
 
 
-concept_stage_by_code = _load_concept_stage_by_code()
+concept_stage_by_code = _load_industry_stage_by_code()
 
-# === 产业链主线家族加成（V11）：持续主线家族成员即便今日回调也优先 ===
-FAMILY_STATUS_BONUS = {'持续主线': 2, '阶段主线': 1}
-
-
-def _merge_family_into_concept_stage():
-    """把产业链家族持续性叠加到概念加权：
-    - 持续主线家族成员 +2，阶段主线家族成员 +1（与概念阶段加成合并，正向封顶+3）
-    - 半导体链这类今日回调但20日持续的主线，成员股不会因今日弱而被埋没。
-    """
-    if code_to_family is None:
-        print("  产业链家族: theme_family.py 不可导入，跳过家族加成")
-        return
-    try:
-        fam_by_code, ferr = code_to_family()
-    except Exception as exc:
-        print(f"  产业链家族加载失败: {exc}")
-        return
-    if ferr:
-        print(f"  产业链家族: {ferr}")
-        return
-    if not fam_by_code:
-        print("  产业链家族: 当前无持续/阶段主线家族")
-        return
-    fam_names = sorted({v['family'] for v in fam_by_code.values()})
-    print(f"  产业链家族: {len(fam_by_code)} 只股票归入主线家族 [{ '、'.join(fam_names) }]")
-    for code, fam in fam_by_code.items():
-        fam_bonus = FAMILY_STATUS_BONUS.get(fam['family_status'], 0)
-        meta = concept_stage_by_code.get(code)
-        if meta is None:
-            meta = {'concept_name': '', 'concept_stage': '—', 'concept_bonus': 0, 'concept_score': 0}
-            concept_stage_by_code[code] = meta
-        meta['family'] = fam['family']
-        meta['family_status'] = fam['family_status']
-        meta['family_active_days20'] = fam['family_active_days20']
-        meta['family_leader_concept'] = fam['family_leader_concept']
-        # 与概念阶段加成合并，正向封顶 +3，避免单一方向权重过大
-        meta['concept_bonus'] = min(meta.get('concept_bonus', 0) + fam_bonus, 3)
-
-
-_merge_family_into_concept_stage()
-
+# 产业链家族加成（V11）已随 concept_member 一并弃用：家族归属同样依赖脏的 concept_member，
+# 其"持续主线"语义已由行业轮动的 '持续主线' 档(上升轮动且 sector_rank≥0.8, +2)承接。
 
 def _concept_meta(code):
     return concept_stage_by_code.get(code, {
@@ -609,10 +569,7 @@ results = []
 for code in (codes if s1_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
-    df = _get_kline(code)
-    if len(df) < 60:
-        continue
-    df = df.dropna(subset=['close','volume'])
+    df = _get_kline(code)          # 已在加载期 dropna，无需再逐股清洗
     if len(df) < 60:
         continue
 
@@ -644,7 +601,7 @@ for code in (codes if s1_role != 'disabled' else []):
     max60 = np.max(c60)
     dd60 = (last - max60) / max60 * 100
     if not (-20 <= dd60 <= -5): continue
-    limit_ups = np.sum(p60 >= 9.5)
+    limit_ups = np.sum(p60 >= _limit_up_threshold(code))
     if limit_ups < 1: continue
 
     # X1: 近5日无单日跌>5%
@@ -888,10 +845,7 @@ s2_results = []
 for code in (codes if s2_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
-    df = _get_kline(code)
-    if len(df) < 60:
-        continue
-    df = df.dropna(subset=['close','volume'])
+    df = _get_kline(code)          # 已在加载期 dropna，无需再逐股清洗
     if len(df) < 60:
         continue
 
@@ -1094,10 +1048,7 @@ s3_results = []
 for code in (codes if s3_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
-    df = _get_kline(code)
-    if len(df) < 60:
-        continue
-    df = df.dropna(subset=['close','volume'])
+    df = _get_kline(code)          # 已在加载期 dropna，无需再逐股清洗
     if len(df) < 60:
         continue
 
@@ -1251,7 +1202,10 @@ else:
 
 s4_role = MODE['strategies'].get('S4', 'disabled')
 s4_cutoff = _sector_cutoff_for('S4')
-s4_allowed_stages = {'主线', '主线分歧', '新晋发酵', '强势观察'}
+# V12对齐修复：concept_stage 现由 _industry_stage_bonus 产出，取值只有
+# 持续主线/上升轮动/强势板块/退潮/普通轮动/—。旧白名单(主线/主线分歧/新晋发酵/强势观察)
+# 来自已弃用的 concept_rotation，与新档位零交集，曾导致 S4 恒空(死代码)。改放行三档强势行业。
+s4_allowed_stages = {'持续主线', '上升轮动', '强势板块'}
 
 print()
 print("=" * 80)
@@ -1261,18 +1215,17 @@ if s4_role == 'disabled':
 else:
     role_tag = _role_label(s4_role)
     print(f"  S4 主线趋势跟随扫描 {role_tag} ({len(codes)}只缓存股票)")
-    print(f"  板块准入线: 强度分位≥{s4_cutoff:.2f}  只做主线/新晋发酵里的龙头或强跟风")
+    print(f"  板块准入线: 强度分位≥{s4_cutoff:.2f}  只做持续主线/上升轮动/强势板块里的龙头或强跟风")
     print("=" * 80)
     print()
 
 s4_results = []
+# 追高门槛拒因统计：以下计数都发生在 stage+梯队 闸门之后，故均为"强势主线+前排"龙头被追高线拦下的数量
+s4_diag = {'stage_block': 0, 'chg5_hi': 0, 'pct_hi': 0, 'dist_hi': 0, 'close_weak': 0, 'vol_bad': 0, 'grade_low': 0}
 for code in (codes if s4_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
-    df = _get_kline(code)
-    if len(df) < 60:
-        continue
-    df = df.dropna(subset=['close','volume'])
+    df = _get_kline(code)          # 已在加载期 dropna，无需再逐股清洗
     if len(df) < 60:
         continue
 
@@ -1309,6 +1262,7 @@ for code in (codes if s4_role != 'disabled' else []):
         continue
     concept_stage = concept_meta.get('concept_stage', '—')
     if concept_stage not in s4_allowed_stages:
+        s4_diag['stage_block'] += 1
         continue
 
     t_info = stock_tier.get(code, {})
@@ -1316,34 +1270,45 @@ for code in (codes if s4_role != 'disabled' else []):
     tier_rank = t_info.get('rank_pct', 0.5)
     if tier_rank > 0.50:
         continue
-    if concept_stage != '主线' and tier_rank > 0.35:
+    if concept_stage != '持续主线' and tier_rank > 0.35:
         continue
 
     chg5 = (cls[-1] / cls[-6] - 1) * 100 if n >= 6 else 0
     chg10 = (cls[-1] / cls[-11] - 1) * 100 if n >= 11 else 0
-    if chg5 < 5 or chg5 > 35:
+    # P2: 强势主线成员放宽反追高门槛(持续主线放最松)，让走强的龙头也能入选；
+    # 离MA5较远者由 _buy_status 自动标'等回踩'，止损/仓位/D2D3 纪律不变。
+    is_core_line = concept_stage == '持续主线'
+    chg5_cap = 50 if is_core_line else 40
+    dist_cap = 11 if is_core_line else 10
+    if chg5 < 5 or chg5 > chg5_cap:
+        if chg5 > chg5_cap:
+            s4_diag['chg5_hi'] += 1
         continue
     if pcts[-1] > 9.2 or turns[-1] > 12:
+        s4_diag['pct_hi'] += 1
         continue
 
     dist_ma5 = (last / ma5 - 1) * 100 if ma5 > 0 else 999
-    if dist_ma5 > 5.5:
+    if dist_ma5 > dist_cap:
+        s4_diag['dist_hi'] += 1
         continue
     day_range = his[-1] - los[-1]
     close_pos = (last - los[-1]) / day_range if day_range > 0 else 0.5
     if close_pos < 0.50:
+        s4_diag['close_weak'] += 1
         continue
-    if concept_stage == '主线分歧' and (pcts[-1] <= 0 or close_pos < 0.65):
-        continue
+    # 原'主线分歧'分歧日强确认过滤随 V12 档位迁移失效(新档位无分歧态)；
+    # 是否对'强势板块'档加"今日翻红+强收"确认留作 P2 决策，P0 不引入新排除。
 
     vol20 = np.mean(vols[-20:])
     vol_ratio = vols[-1] / vol20 if vol20 > 0 else 0
     if vol_ratio < 0.80 or vol_ratio > 4.50:
+        s4_diag['vol_bad'] += 1
         continue
 
     score = 0; details = []
-    if concept_stage == '主线':
-        score += 2; details.append("①主线2")
+    if concept_stage == '持续主线':
+        score += 2; details.append("①持续主线2")
     else:
         score += 1; details.append(f"①{concept_stage}1")
 
@@ -1399,11 +1364,16 @@ for code in (codes if s4_role != 'disabled' else []):
             **concept_meta,
             'strategy': 'S4',
         })
+    else:
+        s4_diag['grade_low'] += 1
 
 s4_results.sort(key=lambda x: (0 if x['grade']=='A' else 1, -x.get('sector_bonus',0), 0 if x.get('tier')=='龙头' else 1, -x['score']))
 
 if s4_role != 'disabled':
     print(f"  通过筛选: {len(s4_results)} 只")
+    print(f"  ├─ 追高线拒掉的强势前排龙头: 距MA5超限{s4_diag['dist_hi']}只 / 5日涨超限{s4_diag['chg5_hi']}只 / 今日封板级{s4_diag['pct_hi']}只")
+    print(f"  ├─ 过追高线后又被后续闸门刷掉: 今日收在下半段{s4_diag['close_weak']}只 / 量比异常{s4_diag['vol_bad']}只 / 评分未达档{s4_diag['grade_low']}只")
+    print(f"  └─ 行业档位未达强势(非持续主线/上升轮动/强势板块)被挡: {s4_diag['stage_block']}只")
 print()
 if s4_results:
     print(f"  {'排名':>4s} {'代码':<12s} {'价格':>7s} {'今涨':>7s} {'评分':>4s} {'级':>2s} {'梯队':>4s} {'板块':>10s} {'概念':>12s} {'5日涨':>7s} {'距MA5':>7s} {'量比':>6s} 明细")
@@ -1459,7 +1429,8 @@ for r in s3_results:
 for r in s4_results:
     all_candidates.append(r)
 
-concept_priority_order = {'主线': 0, '新晋发酵': 1, '主线分歧': 2, '强势观察': 3, '普通轮动': 4}
+# V12档位对齐：按行业轮动强度排序(强→弱)，让持续主线/上升轮动/强势板块的候选排在前面
+concept_priority_order = {'持续主线': 0, '上升轮动': 1, '强势板块': 2, '普通轮动': 3, '退潮': 4}
 def get_concept_priority(c):
     return concept_priority_order.get(c.get('concept_stage', '—'), 9)
 
