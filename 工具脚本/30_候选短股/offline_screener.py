@@ -221,6 +221,18 @@ def _compute_plan(strategy, c, chip, mode):
             hard_stop = ma60_stop
             stop_basis = f"MA60×0.98"
 
+    # S4「等回踩」候选(现价远高于回踩区)：止损/止盈改以回踩区中值为锚，
+    # 否则围绕现价算出的 hard_stop 会落到入场区上方(倒挂)；成交进区后会按实际买价重算。
+    if strategy == 'S4' and price > c['ma5'] * 1.05:
+        ref = (entry_lo + entry_hi) / 2
+        hard_stop = max(ref * 0.97, c['ma5'] * 0.985)
+        soft_stop = ref * 0.985
+        tp1 = ref * (1 + tp1_pct)
+        tp2 = ref * (1 + tp1_pct + trail_pct)
+        tp1_basis = f"回踩买价{ref:.2f}+{tp1_pct:.0%}(等回踩,成交后按实际买价重算)"
+        tp2_basis = f"移动止盈：最高点回落{trail_pct:.1%}全清"
+        stop_basis = "MA5×0.985或回踩买价-3%(等回踩,成交后重算)"
+
     # 确保止盈>入场，止损<入场
     tp1 = max(tp1, entry_hi * 1.005)
     tp2 = max(tp2, tp1 * 1.005)
@@ -861,7 +873,7 @@ for code in (codes if s2_role != 'disabled' else []):
 
     # F1: 市值 30-300亿 (estimate)
     t_last = turns[-1] if len(turns) > 0 else 0
-    if t_last <= 0: continue
+    if not (t_last > 0): continue  # not(>0) 同时拦住 NaN 换手(NaN<=0为False会漏过市值过滤)
     float_mcap = (amts[-1] / (last * 100)) / (t_last / 100) * 100 * last / 1e8
     if float_mcap < 30 or float_mcap > 300: continue
 
@@ -1064,7 +1076,7 @@ for code in (codes if s3_role != 'disabled' else []):
 
     # F1: 市值
     t_last = turns[-1] if len(turns) > 0 else 0
-    if t_last <= 0: continue
+    if not (t_last > 0): continue  # not(>0) 同时拦住 NaN 换手(NaN<=0为False会漏过市值过滤)
     float_mcap = (amts[-1] / (last * 100)) / (t_last / 100) * 100 * last / 1e8
     if float_mcap < 30 or float_mcap > 300: continue
 
@@ -1247,7 +1259,7 @@ for code in (codes if s4_role != 'disabled' else []):
         continue
 
     t_last = turns[-1] if len(turns) > 0 else 0
-    if t_last <= 0:
+    if not (t_last > 0):  # not(>0) 同时拦住 NaN 换手(NaN<=0为False会漏过市值过滤)
         continue
     float_mcap = (amts[-1] / (last * 100)) / (t_last / 100) * 100 * last / 1e8
     if float_mcap < 30 or float_mcap > 800:
