@@ -4,9 +4,9 @@
 股票池重整脚本
 
 功能：
-  1. 用腾讯行情识别当前沪深主板有效股票列表
+  1. 用腾讯行情识别当前沪深主板/创业板/科创板有效股票列表
   2. 删除库内已退市/无效代码的 K 线、行业映射、概念成员关系
-  3. 补充最近新上市但库内缺失的主板股票 K 线
+  3. 补充最近新上市但库内缺失的股票 K 线（含创业板/科创板新股）
 
 默认只演练不改库；确认清单后加 --apply 执行。
 
@@ -48,16 +48,24 @@ def _bs_code(symbol):
     return f"{symbol[:2]}.{symbol[2:]}"
 
 
-def _iter_mainboard_symbols():
+def _iter_market_symbols():
+    # 沪市主板 60xxxx
     for num in range(600000, 606000):
         yield f"sh{num:06d}"
+    # 科创板 688xxx / 689xxx
+    for num in range(688000, 690000):
+        yield f"sh{num:06d}"
+    # 深市主板/中小板 00xxxx
     for num in range(1, 4000):
+        yield f"sz{num:06d}"
+    # 创业板 30xxxx
+    for num in range(300000, 302000):
         yield f"sz{num:06d}"
 
 
-def fetch_tencent_mainboard(batch_size=80, timeout=10):
-    """返回当前沪深主板有效股票 dict: code -> meta。"""
-    symbols = list(_iter_mainboard_symbols())
+def fetch_tencent_universe(batch_size=80, timeout=10):
+    """返回当前沪深主板/创业板/科创板有效股票 dict: code -> meta。"""
+    symbols = list(_iter_market_symbols())
     universe = {}
     status_counts = {}
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -91,7 +99,10 @@ def fetch_tencent_mainboard(batch_size=80, timeout=10):
                 continue
 
             code = _bs_code(symbol)
-            if not (code.startswith("sh.60") or code.startswith("sz.00")):
+            if not (
+                code.startswith("sh.60") or code.startswith("sh.68")
+                or code.startswith("sz.00") or code.startswith("sz.30")
+            ):
                 continue
             universe[code] = {
                 "name": items[1].strip(),
@@ -200,7 +211,7 @@ def fetch_new_klines(new_codes, universe, days=500, sleep_seconds=0.2, apply=Fal
 
 
 def main():
-    parser = argparse.ArgumentParser(description="重整沪深主板股票池")
+    parser = argparse.ArgumentParser(description="重整沪深主板/创业板/科创板股票池")
     parser.add_argument("--apply", action="store_true", help="实际写库；默认只演练")
     parser.add_argument("--new-days", type=int, default=500, help="新补股票拉取最近多少个交易日")
     parser.add_argument("--sleep", type=float, default=0.2, help="补新股时每只股票暂停秒数")
@@ -214,7 +225,7 @@ def main():
     print("=" * 80)
     print(f"  模式: {'写库执行' if args.apply else '只读演练'}")
 
-    universe, status_counts = fetch_tencent_mainboard(batch_size=args.batch_size)
+    universe, status_counts = fetch_tencent_universe(batch_size=args.batch_size)
     conn = get_connection()
     db_codes = get_db_stock_codes(conn)
 
@@ -223,7 +234,7 @@ def main():
     new_codes = sorted(current_codes - db_codes)
 
     print(f"  腾讯状态统计: {status_counts}")
-    print(f"  当前有效主板: {len(current_codes)}  库内主板: {len(db_codes)}")
+    print(f"  当前有效(主板/创业板/科创板): {len(current_codes)}  库内: {len(db_codes)}")
     print(f"  待删除退市/无效: {len(stale_codes)}")
     if stale_codes:
         print("    " + ", ".join(stale_codes[:30]))

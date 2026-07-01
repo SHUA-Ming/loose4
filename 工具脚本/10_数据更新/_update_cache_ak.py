@@ -76,6 +76,28 @@ def bs_to_sina(bs_code):
     return bs_code.replace('.', '')
 
 
+# ═══ Step 0: 刷新股票池（补主板/创业板/科创板新股，删退市）═══
+print("\n🔄 Step 0: 刷新股票池（补新股/删退市）...")
+try:
+    universe_script = Path(__file__).resolve().parent / "_refresh_stock_universe.py"
+    if universe_script.exists():
+        result = subprocess.run(
+            [sys.executable, str(universe_script), "--apply", "--new-days", "300", "--sleep", "0.12"],
+            check=False,
+            timeout=1800,
+        )
+        if result.returncode == 0:
+            print("  股票池刷新完成 ✅")
+        else:
+            print(f"  股票池刷新未完全成功，返回码 {result.returncode}（不影响后续K线更新）")
+    else:
+        print(f"  未找到股票池刷新脚本: {universe_script}")
+except subprocess.TimeoutExpired:
+    print("  股票池刷新超时（不影响K线数据），可稍后单独运行 _refresh_stock_universe.py --apply")
+except Exception as e:
+    print(f"  股票池刷新失败: {e}（不影响后续K线更新）")
+
+
 # ═══ Step 1: 更新三大指数 ═══
 print("\n📊 Step 1: 更新三大指数...")
 INDEX_CODES = {
