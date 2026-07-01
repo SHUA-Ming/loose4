@@ -1294,7 +1294,10 @@ for code in (codes if s4_role != 'disabled' else []):
         continue
     day_range = his[-1] - los[-1]
     close_pos = (last - los[-1]) / day_range if day_range > 0 else 0.5
-    if close_pos < 0.50:
+    # 贴MA5的"现价买"候选要求强收(怕冲高回落)；远离MA5的"等回踩"候选今天本就不买，
+    # 弱收往往正是回踩的开始，只排除收在最底部(潜在破位)的 → 放宽收盘位下限
+    close_floor = 0.50 if dist_ma5 <= 5.5 else 0.30
+    if close_pos < close_floor:
         s4_diag['close_weak'] += 1
         continue
     # 原'主线分歧'分歧日强确认过滤随 V12 档位迁移失效(新档位无分歧态)；
