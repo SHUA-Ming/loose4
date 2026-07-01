@@ -1467,19 +1467,9 @@ buy_status_priority = {'可买': 0, '小仓': 1, '等回踩': 2, '等确认': 3,
 for c in all_candidates:
     c['_buy_status'] = _buy_status_for_candidate(c)
 
-# 同行业只保留最高分
-seen_industry = {}
-dedup_results = []
-for c in sorted(all_candidates, key=lambda x: (buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x), get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier')=='龙头' else 1, -x['score'])):
-    ind = c.get('industry', '')
-    if ind and ind in seen_industry:
-        continue  # 同行业已有更高分的
-    if ind:
-        seen_industry[ind] = c['code']
-    dedup_results.append(c)
-
-# 按策略优先级排序：主力策略 > 辅助策略 > 试探策略
-dedup_results.sort(key=lambda x: (buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x), get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier')=='龙头' else 1, -x['score']))
+# 不做同行业去重：同行业多支合适票全部保留，按优先级排序，由用户按序自行取舍
+# 排序键：可买状态 > 策略角色 > 概念阶段 > 主线加权 > 龙头 > 评分
+dedup_results = sorted(all_candidates, key=lambda x: (buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x), get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier')=='龙头' else 1, -x['score']))
 
 # 仓位修正提示
 pos_mod = MODE.get('position_modifier', 1.0)
@@ -1491,10 +1481,10 @@ if pos_mod < 1.0:
     print()
 
 if dedup_results:
-    print(f"\n  去重后推荐: {len(dedup_results)} 只 (同行业仅保留最高分)")
+    print(f"\n  候选推荐: {len(dedup_results)} 只 (按优先级排序,同行业不去重,同板块多票按序自行取舍)")
     print(f"  {'排名':>4s} {'策略':>4s} {'代码':<12s} {'价格':>7s} {'评分':>6s} {'梯队':>4s} {'板块':>12s} {'概念阶段':>10s} {'买点/仓位'}")
     print("-" * 115)
-    for rank, c in enumerate(dedup_results[:10], 1):
+    for rank, c in enumerate(dedup_results[:15], 1):
         tier_tag = c.get('tier', '—')
         rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
         ind_short = c.get('industry', '')[:10]
