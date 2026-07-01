@@ -1091,22 +1091,30 @@ for code in (codes if s3_role != 'disabled' else []):
     sec_pct = sector_rank.get(ind, 0.5)
     if sec_pct < s3_cutoff and ind: continue
 
-    # X1: 今日涨幅 <= 7%
-    if pcts[-1] > 7: continue
+    # 强势主线成员放宽 S3 追高门槛(与S4同思路)：今日涨幅/5日涨幅/换手上限
+    concept_meta = _concept_meta(code)
+    if _concept_blocked(concept_meta): continue
+    concept_stage = concept_meta.get('concept_stage', '—')
+    is_strong_line = concept_stage in ('持续主线', '上升轮动', '强势板块')
+    is_core_line = concept_stage == '持续主线'
 
-    # X2: 近5日涨幅限制 (V6: 按模式动态调整)
+    # X1: 今日涨幅上限(强势主线放宽 7%→9%)
+    if pcts[-1] > (9 if is_strong_line else 7): continue
+
+    # X2: 近5日涨幅限制 (V6按模式+板块强度动态调整；持续主线再放宽到≥45%)
     chg5 = (cls[-1] / cls[-6] - 1) * 100 if n >= 6 else 0
     x2_limit = s3_x2_limit
-    # V6: 强势板块放宽
     if s3_x2_relax:
         if 'top30_sector' in s3_x2_relax and sec_pct >= 0.7:
             x2_limit = s3_x2_relax['top30_sector']
         elif 'top20_sector' in s3_x2_relax and sec_pct >= 0.8:
             x2_limit = s3_x2_relax['top20_sector']
+    if is_core_line:
+        x2_limit = max(x2_limit, 45)
     if chg5 > x2_limit: continue
 
-    # X3: 换手率 <= 10%
-    if turns[-1] > 10: continue
+    # X3: 换手率上限(强势主线放宽 10%→12%)
+    if turns[-1] > (12 if is_strong_line else 10): continue
 
     # Scoring (6 points)
     score = 0; details = []
@@ -1134,10 +1142,7 @@ for code in (codes if s3_role != 'disabled' else []):
         tier_label = t_info.get('tier', '—')
         tier_rank = t_info.get('rank_pct', 0.5)
         rot_bonus = 1 if ind in rotation_rising else (-1 if ind in rotation_falling else 0)
-        concept_meta = _concept_meta(code)
-        if _concept_blocked(concept_meta):
-            continue
-        concept_bonus = concept_meta.get('concept_bonus', 0)
+        concept_bonus = concept_meta.get('concept_bonus', 0)  # concept_meta 已在 X1 前取
         base_score = score
         rank_score = base_score + rot_bonus + concept_bonus
         s3_results.append({
