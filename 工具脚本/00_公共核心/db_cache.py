@@ -310,6 +310,7 @@ def init_db():
             review_notes TEXT,
             follow_rule  INT,
             remark       TEXT,
+            sysver       VARCHAR(16),
             created_at   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at   TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             KEY idx_trade_status (status, trade_date),
@@ -438,6 +439,7 @@ def _ensure_trade_log_columns(conn):
         ('pnl_5d', "ALTER TABLE trade_log ADD COLUMN pnl_5d DOUBLE AFTER pnl_3d"),
         ('review_notes', "ALTER TABLE trade_log ADD COLUMN review_notes TEXT AFTER pnl_5d"),
         ('updated_at', "ALTER TABLE trade_log ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at"),
+        ('sysver', "ALTER TABLE trade_log ADD COLUMN sysver VARCHAR(16) AFTER remark"),
     ]
     for column, sql in additions:
         if column in columns:
@@ -840,7 +842,7 @@ def add_trade(code, name, buy_date, buy_price, mode='A', grade='A', score=0,
               soft_stop=None, target2_price=None, plan_source=None, buy_status=None,
               emotion_phase=None, market_mode=None, confidence_level=None,
               evidence_summary=None, invalidation_condition=None, risk_notes=None,
-              expected_horizon=None):
+              expected_horizon=None, sysver=None):
     """新增一条买入记录"""
     init_db()
     if amount is None and shares and buy_price:
@@ -854,15 +856,15 @@ def add_trade(code, name, buy_date, buy_price, mode='A', grade='A', score=0,
             buy_date, buy_price, shares, amount, stop_price, soft_stop,
             target_price, target2_price, position, plan_source, buy_status,
             emotion_phase, market_mode, confidence_level, evidence_summary,
-            invalidation_condition, risk_notes, expected_horizon, follow_rule, remark
-        ) VALUES (%s, %s, %s, 'buy', 'open', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)
+            invalidation_condition, risk_notes, expected_horizon, follow_rule, remark, sysver
+        ) VALUES (%s, %s, %s, 'buy', 'open', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s)
     """, (
         code, name, buy_date, strategy, mode, grade, score,
         concept_stage, concept_name, industry, entry_low, entry_high,
         buy_date, buy_price, shares, amount, stop_price, soft_stop,
         target_price, target2_price, position, plan_source, buy_status,
         emotion_phase, market_mode, confidence_level, evidence_summary,
-        invalidation_condition, risk_notes, expected_horizon, remark,
+        invalidation_condition, risk_notes, expected_horizon, remark, sysver,
     ))
     conn.commit()
     trade_id = cur.lastrowid

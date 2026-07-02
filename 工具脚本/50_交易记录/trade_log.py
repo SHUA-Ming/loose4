@@ -26,6 +26,10 @@ from project_paths import ensure_tool_paths
 ensure_tool_paths()
 from db_cache import add_trade, close_trade, get_connection, get_open_trades, get_trade_history, get_trade_stats, init_db
 
+# 当前系统版本号：每次改动选股/风控/情绪逻辑就 +1，并在《交易体系/系统变更日志.md》记一条。
+# buy 不显式传 --sysver 时自动打这个版本，保证每笔都带版本、月末能按版本分段校准。
+CURRENT_SYSVER = 'v1'
+
 
 def today_str():
     return dt.date.today().strftime('%Y-%m-%d')
@@ -121,6 +125,7 @@ def cmd_buy(args):
         risk_notes=args.risk,
         expected_horizon=args.expected,
         remark=args.remark,
+        sysver=args.sysver,
     )
     amount = args.amount if args.amount is not None else (args.shares * args.price if args.shares else None)
     print(f"OK: 买入已记录 ID={trade_id}")
@@ -129,6 +134,7 @@ def cmd_buy(args):
     print(f"  硬止损 {money_text(args.stop)}  软止损 {money_text(args.soft_stop)}  止盈 {money_text(args.target)} / {money_text(args.target2)}")
     print(f"  置信度 {args.confidence or '-'}  证据 {args.evidence or '-'}")
     print(f"  失效条件 {args.invalidation or '-'}  风险 {args.risk or '-'}  验证周期 {args.expected or '-'}")
+    print(f"  系统版本 {args.sysver}")
 
 
 def cmd_sell(args):
@@ -155,7 +161,7 @@ def cmd_open(_args):
         print("当前无持仓记录。")
         return
     cols = [
-        'id', 'code', 'name', 'strategy', 'grade', 'score', 'buy_date', 'buy_price',
+        'id', 'code', 'name', 'strategy', 'sysver', 'grade', 'score', 'buy_date', 'buy_price',
         'shares', 'amount', 'entry_low', 'entry_high', 'stop_price', 'soft_stop',
         'target_price', 'target2_price', 'position', 'confidence_level',
         'invalidation_condition', 'remark'
@@ -171,7 +177,7 @@ def cmd_history(args):
         print("暂无交易记录。")
         return
     cols = [
-        'id', 'code', 'name', 'strategy', 'grade', 'score', 'buy_date', 'buy_price',
+        'id', 'code', 'name', 'strategy', 'sysver', 'grade', 'score', 'buy_date', 'buy_price',
         'sell_date', 'sell_price', 'sell_reason', 'pnl_pct', 'pnl_amount',
         'confidence_level', 'review_result', 'follow_rule', 'remark'
     ]
@@ -214,6 +220,7 @@ def cmd_calibration(args):
         'confidence': 'confidence_level',
         'strategy': 'strategy',
         'mode': 'market_mode',
+        'version': 'sysver',
     }
     group_col = group_map[args.by]
     conn = get_connection()
@@ -297,6 +304,7 @@ def build_parser():
     buy_parser.add_argument('--expected', default='', help='验证周期，如 次日/3日/5日/D2')
     buy_parser.add_argument('--date', help='买入日期 YYYY-MM-DD')
     buy_parser.add_argument('--remark', default='', help='备注')
+    buy_parser.add_argument('--sysver', default=CURRENT_SYSVER, help=f'系统版本号，默认当前 {CURRENT_SYSVER}（改逻辑后 bump CURRENT_SYSVER 即可）')
     buy_parser.set_defaults(func=cmd_buy)
 
     sell_parser = sub.add_parser('sell', help='记录卖出/平仓')
@@ -326,7 +334,7 @@ def build_parser():
     review_parser.set_defaults(func=cmd_review)
 
     calibration_parser = sub.add_parser('calibration', help='按置信度/策略/模式统计预测校准表现')
-    calibration_parser.add_argument('--by', choices=['confidence', 'strategy', 'mode'], default='confidence', help='分组字段')
+    calibration_parser.add_argument('--by', choices=['confidence', 'strategy', 'mode', 'version'], default='confidence', help='分组字段')
     calibration_parser.set_defaults(func=cmd_calibration)
 
     stats_parser = sub.add_parser('stats', help='查看胜率/盈亏/纪律统计')
