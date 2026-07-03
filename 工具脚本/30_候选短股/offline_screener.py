@@ -13,7 +13,7 @@
   - 跨策略同行业去重
     - V8 S1评分、统一止盈和概念阶段过滤
 """
-import sys, warnings
+import sys, warnings, json
 from pathlib import Path
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -366,6 +366,27 @@ def _get_kline_full(code):
         df = pd.DataFrame()
     _FULL_KLINE_CACHE[code] = df
     return df
+
+# === 中报景气倾斜因子（Phase1 影子：仅展示+对照榜，不改实盘排序）===
+# 数据在 boom_tier.json；boom_tier(code)=theme_tier[code_theme[code]]，未覆盖=中性(None)。
+# 详见 交易体系/景气倾斜因子_设计.md。更新只改 json，不动本文件。
+BOOM_TILT_ACTIVE = False   # 总开关：False=影子(排序零改动)；True=激活(景气进合并排序tie-breaker)
+BOOM_SCORE_BAND  = 2       # "分值相近"档宽：|score差|≤此值视为同档，同档内才让景气插队
+_theme_tier, _code_theme = {}, {}
+try:
+    _boom_cfg = json.loads((Path(__file__).parent / 'boom_tier.json').read_text('utf-8'))
+    _theme_tier = _boom_cfg.get('theme_tier', {})
+    _code_theme = _boom_cfg.get('code_theme', {})
+    print(f"  景气因子: boom_tier.json v{_boom_cfg.get('version','?')} 载入 {len(_code_theme)} 只归类 "
+          f"({'🟢激活' if BOOM_TILT_ACTIVE else '👀影子'})")
+except Exception as _exc:
+    print(f"  景气因子: 载入 boom_tier.json 失败 ({_exc})，本次不做景气倾斜")
+
+def _boom_tier(code):
+    """返回 1(最景气)…4(回避)；None=中性。"""
+    return _theme_tier.get(_code_theme.get(code, ''), None)
+
+_BOOM_LABEL = {1: '🟢T1', 2: '🟡T2', 3: '⚪T3', 4: '🔴T4', None: '·'}
 
 # === 加载行业映射和板块数据 ===
 industry_map = {}
@@ -1466,10 +1487,25 @@ def get_strategy_priority(c):
 buy_status_priority = {'可买': 0, '小仓': 1, '等回踩': 2, '等确认': 3, '仅观察': 4}
 for c in all_candidates:
     c['_buy_status'] = _buy_status_for_candidate(c)
+    c['boom_tier']  = _boom_tier(c['code'])          # 中报景气档 1~4 / None=中性
+    c['boom_label'] = _BOOM_LABEL.get(c['boom_tier'], '·')
+
+# 景气倾斜 tie-breaker（Phase1 仅供影子对照榜；BOOM_TILT_ACTIVE=True 才进实盘排序）
+def get_boom_priority(c):            # 越小越靠前：T1 > T2 > 中性/T3 > T4
+    return {1: 0, 2: 1, None: 2, 3: 2, 4: 3}.get(c.get('boom_tier'), 2)
+def _boom_score_band(c):            # 分数分档：|差|≤BAND 视为同档，让"相近分"并列
+    return -(round(c['score'] / BOOM_SCORE_BAND))
+def _merge_sort_key(x, boom):
+    # 前段(可买>策略>概念>主线>龙头)与原逻辑完全一致；景气仅在"同龙头、相近分"内插队
+    head = (buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x),
+            get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier') == '龙头' else 1)
+    if boom:
+        return head + (_boom_score_band(x), get_boom_priority(x), -x['score'])
+    return head + (-x['score'],)   # boom 关闭 → 与改动前逐字节等价
 
 # 不做同行业去重：同行业多支合适票全部保留，按优先级排序，由用户按序自行取舍
-# 排序键：可买状态 > 策略角色 > 概念阶段 > 主线加权 > 龙头 > 评分
-dedup_results = sorted(all_candidates, key=lambda x: (buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x), get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier')=='龙头' else 1, -x['score']))
+# 排序键：可买状态 > 策略角色 > 概念阶段 > 主线加权 > 龙头 >〔景气档(激活时)〕> 评分
+dedup_results = sorted(all_candidates, key=lambda x: _merge_sort_key(x, BOOM_TILT_ACTIVE))
 
 # 仓位修正提示
 pos_mod = MODE.get('position_modifier', 1.0)
@@ -1482,7 +1518,7 @@ if pos_mod < 1.0:
 
 if dedup_results:
     print(f"\n  候选推荐: {len(dedup_results)} 只 (按优先级排序,同行业不去重,同板块多票按序自行取舍)")
-    print(f"  {'排名':>4s} {'策略':>4s} {'代码':<12s} {'价格':>7s} {'评分':>6s} {'梯队':>4s} {'板块':>12s} {'概念阶段':>10s} {'买点/仓位'}")
+    print(f"  {'排名':>4s} {'策略':>4s} {'代码':<12s} {'价格':>7s} {'评分':>6s} {'梯队':>4s} {'景气':>4s} {'板块':>12s} {'概念阶段':>10s} {'买点/仓位'}")
     print("-" * 115)
     for rank, c in enumerate(dedup_results[:15], 1):
         tier_tag = c.get('tier', '—')
@@ -1502,9 +1538,30 @@ if dedup_results:
             concept_text = f"{concept_text}:{c['concept_name'][:6]}"
         fam = c.get('family', '')
         fam_tag = f" 〔{fam}·{c.get('family_status','')}{c.get('family_active_days20',0)}/20〕" if fam else ''
-        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {ind_short:>12s}{rot_tag} {concept_text:>10s}{fam_tag}  {advice}")
+        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {c.get('boom_label','·'):>4s} {ind_short:>12s}{rot_tag} {concept_text:>10s}{fam_tag}  {advice}")
 else:
     print("\n  （无最终推荐候选）")
+
+# ═══ 景气加权 影子对照榜（Phase1·2026-07-03加·纯展示不改实盘排序/不下单）═══
+# 见 交易体系/景气倾斜因子_设计.md。↑/↓=相对上面实盘榜的名次变化，用于眼验是否更优。
+_boomed = [c for c in all_candidates if c.get('boom_tier') is not None]
+if dedup_results and _boomed and not BOOM_TILT_ACTIVE:
+    boom_view = sorted(all_candidates, key=lambda x: _merge_sort_key(x, True))
+    _orig_rank = {id(c): i for i, c in enumerate(dedup_results)}
+    print("\n" + "─" * 80)
+    print(f"  👀 景气加权 影子对照榜 TOP15   档宽±{BOOM_SCORE_BAND}分 · 纯展示不下单 · 命中景气 {len(_boomed)} 只")
+    print("─" * 80)
+    print(f"  {'新':>3s} {'原':>3s} {'升降':>4s} {'策略':>4s} {'代码':<12s} {'评分':>5s} {'景气':>4s} {'板块':>12s}")
+    for nr, c in enumerate(boom_view[:15], 1):
+        orr = _orig_rank.get(id(c))
+        if orr is None:
+            move, orig_txt = '—', '-'
+        else:
+            orig_txt = str(orr + 1)
+            move = '=' if orr + 1 == nr else (f'↑{orr + 1 - nr}' if orr + 1 > nr else f'↓{nr - orr - 1}')
+        print(f"  {nr:>3d} {orig_txt:>3s} {move:>4s} {c.get('strategy','?'):>4s} {c['code']:<12s} "
+              f"{c['score']:>5d} {c.get('boom_label','·'):>4s} {(c.get('industry') or '')[:10]:>12s}")
+    print("  （上面『候选推荐』才是当前实盘排序；本榜仅预览『若激活景气因子』的样子）")
 
 # ═══ 尾盘执行提醒（回测校准，2026-07-03加，非硬规则/不改选股） ═══
 # 依据: S4信号回测 N=21901。①进场"等回踩vs即时买"、②出场"早盘vs持有D2" 均随行情档反向：
