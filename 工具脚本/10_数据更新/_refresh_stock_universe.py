@@ -70,16 +70,24 @@ def fetch_tencent_universe(batch_size=80, timeout=10):
     status_counts = {}
     headers = {"User-Agent": "Mozilla/5.0"}
 
+    failed_batches = 0
     for start in range(0, len(symbols), batch_size):
         batch = symbols[start:start + batch_size]
-        try:
-            resp = requests.get(
-                "http://qt.gtimg.cn/q=" + ",".join(batch),
-                headers=headers,
-                timeout=timeout,
-            )
-            resp.encoding = "gbk"
-        except Exception:
+        resp = None
+        for _attempt in range(2):  # 一次重试，降低偶发丢批（丢批会把有效股误判为退市）
+            try:
+                resp = requests.get(
+                    "http://qt.gtimg.cn/q=" + ",".join(batch),
+                    headers=headers,
+                    timeout=timeout,
+                )
+                resp.encoding = "gbk"
+                break
+            except Exception:
+                resp = None
+                time.sleep(0.5)
+        if resp is None:
+            failed_batches += 1
             continue
 
         for line in resp.text.strip().split("\n"):
@@ -111,6 +119,9 @@ def fetch_tencent_universe(batch_size=80, timeout=10):
                 "quote_time": items[30].strip(),
             }
 
+    if failed_batches:
+        print(f"  ⚠️ 腾讯抓取有 {failed_batches} 个批次失败（每批~{batch_size}只），universe 可能不完整")
+    status_counts["_failed_batches"] = failed_batches
     return universe, status_counts
 
 
@@ -243,11 +254,35 @@ def main():
         preview = [f"{code} {universe[code]['name']}" for code in new_codes[:30]]
         print("    " + ", ".join(preview))
 
-    delete_counts = delete_stale_codes(conn, stale_codes, apply=args.apply)
-    if delete_counts:
-        action = "已删除" if args.apply else "将删除"
-        for table, count in delete_counts.items():
-            print(f"  {action} {table}: {count} 行")
+    # ═══ 删除安全护栏（2026-07-02 事故：腾讯丢批→189只有效股被误判退市删除）═══
+    # 腾讯抓取残缺时，正常股会缺席 universe 而被当成退市。删除前做双重体检：
+    #   1) universe 明显偏小 → 抓取不完整
+    #   2) 待删除数量异常偏多 → 极可能是丢批而非真退市
+    # 命中任一则本轮跳过删除（新股补充照常，只增不删是安全的）。
+    UNIVERSE_FLOOR = 4800   # 沪深主板+创业板+科创板正常 >5000
+    STALE_CEILING = 50      # 真实单日退市/摘牌远小于此
+    delete_blocked = False
+    block_reason = ""
+    if status_counts.get("_failed_batches"):
+        delete_blocked = True
+        block_reason = f"腾讯有 {status_counts['_failed_batches']} 个批次抓取失败"
+    elif len(current_codes) < UNIVERSE_FLOOR:
+        delete_blocked = True
+        block_reason = f"universe 仅 {len(current_codes)} (<{UNIVERSE_FLOOR})，疑似抓取不完整"
+    elif len(stale_codes) > STALE_CEILING:
+        delete_blocked = True
+        block_reason = f"待删除 {len(stale_codes)} 只 (>{STALE_CEILING})，异常偏多"
+
+    if delete_blocked and stale_codes:
+        print(f"  🛑 已拦截删除：{block_reason}。本轮不删任何代码，只补新股。")
+        print(f"     如确认这 {len(stale_codes)} 只确为退市，人工核对后再单独执行删除。")
+        delete_counts = {}
+    else:
+        delete_counts = delete_stale_codes(conn, stale_codes, apply=args.apply)
+        if delete_counts:
+            action = "已删除" if args.apply else "将删除"
+            for table, count in delete_counts.items():
+                print(f"  {action} {table}: {count} 行")
 
     name_rows = upsert_new_stock_names(conn, new_codes, universe, apply=args.apply)
     if new_codes:

@@ -796,7 +796,7 @@ if results:
     print("-" * 155)
     for rank, c in enumerate(results[:20], 1):
         sig = f" 💥{c['signals']}" if c['signals'] else ""
-        sec_tag = f"🔥{c['industry'][:6]}" if c.get('sector_bonus') else c.get('industry','')[:8]
+        sec_tag = f"🔥{(c.get('industry') or '')[:6]}" if c.get('sector_bonus') else (c.get('industry') or '')[:8]
         tier_tag = c.get('tier', '—')
         rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
         print(f"{rank:>4d} {c['code']:<12s} {c['price']:>7.2f} {c['pct_today']:>+6.2f}% {c['score']:>4d} {c['grade']:>2s} {tier_tag:>4s} {sec_tag:>10s}{rot_tag} {c['vr520']:>8.2f} {c['turn5']:>6.2f}% {c['ma_sp']:>5.2f}% {c['rng5']:>5.2f}% {c['pct60']:>+6.1f}% {c['dd60']:>+6.1f}%  {c['details']}{sig}")
@@ -997,7 +997,7 @@ if s2_results:
     print(f"  {'排名':>4s} {'代码':<12s} {'价格':>7s} {'今涨':>7s} {'评分':>4s} {'级':>2s} {'梯队':>4s} {'板块':>10s} {'大阳日':>10s} {'阳线涨':>7s} {'量缩':>6s} {'价守':>6s} {'天后':>4s} 明细")
     print("-" * 140)
     for rank, c in enumerate(s2_results[:20], 1):
-        sec_tag = f"🔥{c['industry'][:6]}" if c.get('sector_bonus') else c.get('industry','')[:8]
+        sec_tag = f"🔥{(c.get('industry') or '')[:6]}" if c.get('sector_bonus') else (c.get('industry') or '')[:8]
         tier_tag = c.get('tier', '—')
         rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
         print(f"  {rank:>3d} {c['code']:<12s} {c['price']:>7.2f} {c['pct_today']:>+6.2f}% {c['score']:>4d} {c['grade']:>2s} {tier_tag:>4s} {sec_tag:>10s}{rot_tag} {c['bc_date']:>10s} {c['bc_pct']:>+6.1f}% {c['vol_shrink']:>5.2f} {c['price_hold']:>5.2f} {c['days_after']:>3d}d  {c['details']}")
@@ -1180,7 +1180,7 @@ if s3_results:
     print(f"  {'排名':>4s} {'代码':<12s} {'价格':>7s} {'今涨':>7s} {'评分':>4s} {'级':>2s} {'梯队':>4s} {'板块':>10s} {'突破':>7s} {'量比':>6s} {'5日涨':>7s} 明细")
     print("-" * 120)
     for rank, c in enumerate(s3_results[:20], 1):
-        sec_tag = f"🔥{c['industry'][:6]}" if c.get('sector_bonus') else c.get('industry','')[:8]
+        sec_tag = f"🔥{(c.get('industry') or '')[:6]}" if c.get('sector_bonus') else (c.get('industry') or '')[:8]
         tier_tag = c.get('tier', '—')
         rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
         print(f"  {rank:>3d} {c['code']:<12s} {c['price']:>7.2f} {c['pct_today']:>+6.2f}% {c['score']:>4d} {c['grade']:>2s} {tier_tag:>4s} {sec_tag:>10s}{rot_tag} {c['brk_pct']:>+6.1f}% {c['vol_ratio']:>5.1f}x {c['chg5']:>+6.1f}%  {c['details']}")
@@ -1399,7 +1399,7 @@ if s4_results:
     print(f"  {'排名':>4s} {'代码':<12s} {'价格':>7s} {'今涨':>7s} {'评分':>4s} {'级':>2s} {'梯队':>4s} {'板块':>10s} {'概念':>12s} {'5日涨':>7s} {'距MA5':>7s} {'量比':>6s} 明细")
     print("-" * 150)
     for rank, c in enumerate(s4_results[:20], 1):
-        sec_tag = f"🔥{c['industry'][:6]}" if c.get('sector_bonus') else c.get('industry','')[:8]
+        sec_tag = f"🔥{(c.get('industry') or '')[:6]}" if c.get('sector_bonus') else (c.get('industry') or '')[:8]
         tier_tag = c.get('tier', '—')
         rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
         concept_text = c.get('concept_stage', '—')
@@ -1487,7 +1487,7 @@ if dedup_results:
     for rank, c in enumerate(dedup_results[:15], 1):
         tier_tag = c.get('tier', '—')
         rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
-        ind_short = c.get('industry', '')[:10]
+        ind_short = (c.get('industry') or '')[:10]
         s_tag = c.get('strategy', '?')
         if pos_mod == 0:
             advice = '❌禁止开仓'
@@ -1505,6 +1505,36 @@ if dedup_results:
         print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {ind_short:>12s}{rot_tag} {concept_text:>10s}{fam_tag}  {advice}")
 else:
     print("\n  （无最终推荐候选）")
+
+# ═══ 尾盘执行提醒（回测校准，2026-07-03加，非硬规则/不改选股） ═══
+# 依据: S4信号回测 N=21901。①进场"等回踩vs即时买"、②出场"早盘vs持有D2" 均随行情档反向：
+#   强市(M3/M4指数强)→顺势拿(等回踩可分批即时/出场让它跑到D2)；
+#   震荡弱市(M1/M2)→快进快出(严格等回踩/早盘就卖)。开盘瞬间通常不高(高开仅~36%)，冲高在盘中，用限价接。
+_exec_mode = MODE['mode']
+_strong = _exec_mode in ('M3', 'M4')
+_regime_tag = '强势·顺势拿' if _strong else ('极端·禁开仓' if _exec_mode == 'M5' else '震荡/弱·快进快出')
+print("\n" + "═" * 80)
+print(f"  ⏱️  尾盘执行提醒   行情档={_exec_mode}·{_regime_tag}   (回测校准建议·非硬规则)")
+print("═" * 80)
+if pos_mod == 0 or _exec_mode == 'M5':
+    print("  情绪=退潮/过热 或 M5 → 今日禁止开仓，仅做持仓管理与下方早盘出场。")
+else:
+    print("  ── 进场（按每票买点状态）──")
+    print("   · 可买   → 尾盘 14:40-14:55 直接买（现价已在买入区内）")
+    print("   · 小仓   → 尾盘半仓；尾盘四项确认不足则放弃")
+    if _strong:
+        print("   · 等回踩 → [强市] 尾盘半仓即时 + 另半仓挂回踩区限价；到价前复核大盘/板块未转弱再留单，追不到只持半仓不补")
+    else:
+        print("   · 等回踩 → [震荡/弱] 回踩到区间先复核(大盘/板块/是否放量破位)再手动买，别盲挂自动成交限价；追不到记『错过』放弃")
+    print("   · 等确认 → 等放量站回区间再动；  仅观察 → 不买")
+    print("   · ⚠️ 到买入价≠可买: 放量跌破区下沿 / 竞价低开>3% / 板块转退潮 / 大盘跳水  任一 → 放弃或暂缓, 别盲接")
+print("  ── 次日早盘出场（先挂半仓限价，捕捉冲高）──")
+print("   · 全档: 开盘即挂 +2~2.5% 限价先卖一半（回测成交率~40%，成交均价≈+2.2%）")
+if _strong:
+    print("   · [强市] 剩半仓移动止盈(最高回落2.5~3%)让它跑到 D2，别急着封顶(回测D2持有更优)")
+else:
+    print("   · [震荡/弱] 剩半仓早盘走弱/冲高回落即一起清，别死等 D2（回测D2会还回利润）")
+print("   · 提醒: 『冲高』在盘中不在开盘瞬间(高开仅~36%)，用限价接，别市价挂在开盘")
 
 conn.close()
 print("\n分析完成。")
