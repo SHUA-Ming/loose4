@@ -156,6 +156,22 @@ def _scrape_l3_members(l3_code, today, retries=3):
     return _retry(f'{l3_code}成分', _do, retries=retries, sleep_seconds=2)
 
 
+def _db_info_codes(level):
+    """回退用：从库里已有的 sw_industry_info 取某级 (code, name)。
+    akshare 的 sw_index_*_info 页偶发整级爬空(返回 None → find_all 报错)，此时不能空手而归——
+    日K接口 index_hist_sw 只认代码、不依赖 info 页，用库存代码照样能把当日日K拉回来。只读查询。"""
+    conn = get_connection(readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT code, name FROM sw_industry_info WHERE level=? ORDER BY code", (level,)
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    return [(r[0], r[1]) for r in rows]
+
+
 def _active_l3_codes(days=10):
     """返回近端有日K的三级代码(剔除申万改版停更的旧代码)。只读查询。"""
     conn = get_connection(readonly=True)
@@ -326,7 +342,13 @@ def main():
     targets = []
     for level in sorted(want_levels):
         rows = info_by_level.get(level, [])
-        codes = [(r[0], r[2]) for r in rows]  # (code, name)
+        if rows:
+            codes = [(r[0], r[2]) for r in rows]  # (code, name)
+        else:
+            # 本次该级 info 爬取失败/为空 → 回退用库存代码，别让整晚日K更新白跑
+            codes = _db_info_codes(level)
+            if codes:
+                print(f"  {level}级info本次为空，回退用库存 {len(codes)} 个代码继续拉日K")
         if args.limit > 0:
             codes = codes[:args.limit]
         targets.extend([(level, c, n) for c, n in codes])
