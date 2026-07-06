@@ -310,6 +310,18 @@ def _print_chip(chip):
 
 codes = [r[0] for r in conn.execute('SELECT DISTINCT code FROM kline_daily').fetchall()]
 
+# ═══ 主板过滤 (sysver v2, 2026-07-06) ═══
+# 用户账户只开通主板权限，只能买 00 开头(深主板 000/001/002/003) 和 60 开头(沪主板 600/601/603/605)。
+# 创业板(300/301)、科创板(688/689)、北交所(4x/8x/920)、B股(200/900) 一律买不了 → 不进任何策略候选。
+# 只过滤"候选选票"，不动 codes 全量：板块强度/行业轮动仍用全量DB计算，创业板票照常参与其行业动量。
+def _is_mainboard(code):
+    d = str(code).split('.')[-1]
+    return d.startswith('00') or d.startswith('60')
+
+tradeable_codes = [c for c in codes if _is_mainboard(c)]
+print(f"  >>> 主板过滤(sysver v2)：{len(codes)} → {len(tradeable_codes)} 只可交易(00/60主板)，"
+      f"剔除创业板/科创板/北交所/B股 {len(codes)-len(tradeable_codes)} 只", flush=True)
+
 # ═══ 性能优化：K线分两级加载 ═══
 # 扫描（S1~S4 的 [-60:] 等计算）只需近端数据 → 一次性读近 300 天入内存(~7s)，按 code 切片复用；
 # 筹码分析（analyze_chip_cost）需要全历史的衰减分布 → 仅对进入分析的候选(~数十只)按需查全量并缓存。
@@ -599,7 +611,7 @@ else:
 print()
 
 results = []
-for code in (codes if s1_role != 'disabled' else []):
+for code in (tradeable_codes if s1_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
     df = _get_kline(code)          # 已在加载期 dropna，无需再逐股清洗
@@ -875,7 +887,7 @@ else:
     print()
 
 s2_results = []
-for code in (codes if s2_role != 'disabled' else []):
+for code in (tradeable_codes if s2_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
     df = _get_kline(code)          # 已在加载期 dropna，无需再逐股清洗
@@ -1078,7 +1090,7 @@ else:
     print()
 
 s3_results = []
-for code in (codes if s3_role != 'disabled' else []):
+for code in (tradeable_codes if s3_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
     df = _get_kline(code)          # 已在加载期 dropna，无需再逐股清洗
@@ -1260,7 +1272,7 @@ else:
 s4_results = []
 # 追高门槛拒因统计：以下计数都发生在 stage+梯队 闸门之后，故均为"强势主线+前排"龙头被追高线拦下的数量
 s4_diag = {'stage_block': 0, 'chg5_hi': 0, 'pct_hi': 0, 'dist_hi': 0, 'close_weak': 0, 'vol_bad': 0, 'grade_low': 0}
-for code in (codes if s4_role != 'disabled' else []):
+for code in (tradeable_codes if s4_role != 'disabled' else []):
     if code.startswith('sh.000') or code.startswith('sz.399'):
         continue
     df = _get_kline(code)          # 已在加载期 dropna，无需再逐股清洗

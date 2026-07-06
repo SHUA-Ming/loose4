@@ -28,7 +28,7 @@ from db_cache import add_trade, close_trade, get_connection, get_open_trades, ge
 
 # 当前系统版本号：每次改动选股/风控/情绪逻辑就 +1，并在《交易体系/系统变更日志.md》记一条。
 # buy 不显式传 --sysver 时自动打这个版本，保证每笔都带版本、月末能按版本分段校准。
-CURRENT_SYSVER = 'v1'
+CURRENT_SYSVER = 'v2'
 
 
 def today_str():
