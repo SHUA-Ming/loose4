@@ -262,6 +262,53 @@ def init_db():
             KEY idx_concept_date (source, concept_name, date)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 
+        # ═══ 申万行业三层树信息表（一级31/二级~134/三级336）═══
+        # 提供"能分级、不重叠"的行业骨架，补证监会大类(单层)与同花顺概念(扁平)之外的第三级粒度。
+        """CREATE TABLE IF NOT EXISTS sw_industry_info (
+            code            VARCHAR(16)   NOT NULL,
+            level           TINYINT       NOT NULL,
+            name            VARCHAR(64),
+            parent_name     VARCHAR(64),
+            member_count    INT,
+            pe_ttm          DOUBLE,
+            pb              DOUBLE,
+            update_date     DATE,
+            updated_at      TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (code),
+            KEY idx_level (level),
+            KEY idx_parent (parent_name)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+
+        # ═══ 申万行业指数日K表（三级/一级指数行情，供两周轮动分析）═══
+        """CREATE TABLE IF NOT EXISTS sw_industry_daily (
+            code    VARCHAR(16)  NOT NULL,
+            date    DATE         NOT NULL,
+            open    DOUBLE,
+            high    DOUBLE,
+            low     DOUBLE,
+            close   DOUBLE,
+            volume  DOUBLE,
+            amount  DOUBLE,
+            pctChg  DOUBLE,
+            updated_at TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (code, date),
+            KEY idx_date (date)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+
+        # ═══ 申万三级行业成分股映射表（三级→个股，供"走强三级挑主板龙头"）═══
+        # 数据来源：legulegu 成分表(akshare sw_index_third_cons 的上游)；官方 akshare 接口贴列名坏了，
+        # 取数脚本按列位置解析。成分慢变，每周刷一次即可。
+        """CREATE TABLE IF NOT EXISTS sw_industry_member (
+            l3_code     VARCHAR(16)  NOT NULL,
+            stock_code  VARCHAR(16)  NOT NULL,
+            stock_name  VARCHAR(64),
+            update_date DATE,
+            updated_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (l3_code, stock_code),
+            KEY idx_stock (stock_code),
+            KEY idx_l3 (l3_code)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+
         # ═══ 交易记录表 ═══
         """CREATE TABLE IF NOT EXISTS trade_log (
             id           BIGINT       AUTO_INCREMENT PRIMARY KEY,
@@ -789,6 +836,73 @@ def replace_concept_members(source, concept_name, rows):
                 VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     code_name=VALUES(code_name), update_date=VALUES(update_date)
+            """, rows)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    return len(rows)
+
+
+def upsert_sw_industry_info(rows):
+    """
+    批量写入申万行业三层树信息。
+    rows: list of (code, level, name, parent_name, member_count, pe_ttm, pb, update_date)
+    """
+    if not rows:
+        return 0
+    conn = get_connection()
+    conn.executemany("""
+        INSERT INTO sw_industry_info (code, level, name, parent_name, member_count,
+            pe_ttm, pb, update_date)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            level=VALUES(level), name=VALUES(name), parent_name=VALUES(parent_name),
+            member_count=VALUES(member_count), pe_ttm=VALUES(pe_ttm), pb=VALUES(pb),
+            update_date=VALUES(update_date)
+    """, rows)
+    conn.commit()
+    conn.close()
+    return len(rows)
+
+
+def upsert_sw_industry_daily(rows):
+    """
+    批量写入申万行业指数日K。
+    rows: list of (code, date, open, high, low, close, volume, amount, pctChg)
+    """
+    if not rows:
+        return 0
+    conn = get_connection()
+    conn.executemany("""
+        INSERT INTO sw_industry_daily (code, date, open, high, low, close,
+            volume, amount, pctChg)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            open=VALUES(open), high=VALUES(high), low=VALUES(low), close=VALUES(close),
+            volume=VALUES(volume), amount=VALUES(amount), pctChg=VALUES(pctChg)
+    """, rows)
+    conn.commit()
+    conn.close()
+    return len(rows)
+
+
+def replace_sw_industry_member(l3_code, rows):
+    """
+    替换某个申万三级行业的成分股。
+    rows: list of (l3_code, stock_code, stock_name, update_date)
+    """
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM sw_industry_member WHERE l3_code = ?", (l3_code,))
+        if rows:
+            conn.executemany("""
+                INSERT INTO sw_industry_member (l3_code, stock_code, stock_name, update_date)
+                VALUES (%s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    stock_name=VALUES(stock_name), update_date=VALUES(update_date)
             """, rows)
         conn.commit()
     except Exception:
