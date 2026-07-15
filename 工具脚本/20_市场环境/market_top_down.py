@@ -22,7 +22,6 @@ if str(_COMMON_DIR) not in sys.path:
 from project_paths import ensure_tool_paths
 ensure_tool_paths()
 from sina_kline import fetch_kline
-import pandas as pd
 import numpy as np
 from datetime import datetime
 
@@ -200,6 +199,6 @@ print(f"    第1步: 大盘方向 → 决定能不能操作")
 print(f"    第2步: 板块强弱 → 决定操作哪个方向")
 print(f"    第3步: 个股信号 → 决定具体买哪只")
 print(f"  ────────────────────────────────────")
-print(f"  注: 运行后请结合板块分析(gold_compare.py等)和个股分析(batch_fetch.py)")
+print(f"  注: 运行后请结合 market_mode.py、em_board_rotation.py 和 offline_screener.py")
 
 print("\n分析完成。")

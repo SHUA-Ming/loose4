@@ -159,7 +159,6 @@ def delete_stale_codes(conn, codes, apply=False):
     tables = [
         ("kline_daily", "code"),
         ("stock_industry", "code"),
-        ("concept_member", "code"),
     ]
     deleted = {}
     for table, code_col in tables:

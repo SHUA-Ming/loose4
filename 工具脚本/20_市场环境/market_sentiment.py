@@ -22,10 +22,9 @@ if str(_COMMON_DIR) not in sys.path:
     sys.path.insert(0, str(_COMMON_DIR))
 from project_paths import ensure_tool_paths
 ensure_tool_paths()
-from db_cache import get_connection, init_db
+from db_cache import get_connection
 import pandas as pd
 import numpy as np
-from collections import defaultdict
 
 
 
@@ -322,15 +321,31 @@ def _detect_cycle(dates, limit_up, limit_down, up_count, down_count,
 
 def _detect_sector_rotation(conn, dates):
     """
-    板块轮动预判：
-    - 找出连续3日排名上升的板块（新晋强势）
-    - 找出连续3日排名下降的板块（退潮板块）
-    - 找出波动最大的板块（可能轮动目标）
+    东方财富三级行业轮动预判：
+    - 找出连续3日排名上升的三级行业（新晋强势）
+    - 找出连续3日排名下降的三级行业（退潮板块）
+    - 返回字段名仍沿用 sector_rotation，便于下游兼容
     """
     if len(dates) < 5:
         return {}
 
-    sec_df = pd.read_sql('SELECT industry, date, avg_pct FROM sector_daily ORDER BY date, avg_pct DESC', conn)
+    sec_df = pd.read_sql("""
+        SELECT d.board_code,
+               l3.board_name AS industry,
+               l2.board_name AS l2,
+               l1.board_name AS l1,
+               d.date,
+               d.pctChg AS avg_pct
+        FROM em_board_daily d
+        JOIN em_board_l3 l3 ON d.board_code = l3.board_code
+        JOIN em_board_l2 l2 ON l3.l2_id = l2.id
+        JOIN em_board_l1 l1 ON l3.l1_id = l1.id
+        WHERE d.level = 3
+        ORDER BY d.date, d.pctChg DESC
+    """, conn)
+    if sec_df.empty:
+        return {}
+    sec_df['date'] = sec_df['date'].astype(str)
     sec_df['avg_pct'] = pd.to_numeric(sec_df['avg_pct'], errors='coerce')
 
     # 每日板块排名
@@ -338,15 +353,29 @@ def _detect_sector_rotation(conn, dates):
     for d, grp in sec_df.groupby('date'):
         grp = grp.sort_values('avg_pct', ascending=False).reset_index(drop=True)
         for i, row in grp.iterrows():
-            daily_rank[(row['industry'], d)] = i + 1
+            daily_rank[(row['board_code'], d)] = i + 1
 
-    recent5 = dates[-5:]
-    all_industries = sec_df['industry'].unique()
+    available_dates = sorted(sec_df['date'].unique())
+    date_set = set(available_dates)
+    recent5 = [str(d) for d in dates if str(d) in date_set][-5:]
+    if len(recent5) < 5:
+        recent5 = available_dates[-5:]
+    if len(recent5) < 5:
+        return {}
+
+    board_meta = (
+        sec_df[['board_code', 'industry', 'l1', 'l2']]
+        .drop_duplicates('board_code')
+        .set_index('board_code')
+        .to_dict('index')
+    )
+    all_boards = list(board_meta.keys())
+    default_rank = len(all_boards) + 1
 
     # 计算每个板块近5日排名变化
     rotation = []
-    for ind in all_industries:
-        ranks = [daily_rank.get((ind, d), 50) for d in recent5]
+    for board_code in all_boards:
+        ranks = [daily_rank.get((board_code, d), default_rank) for d in recent5]
         if len(ranks) < 5:
             continue
         # 排名变化趋势（排名下降=变强）
@@ -361,14 +390,18 @@ def _detect_sector_rotation(conn, dates):
         # 单日涨幅
         last_pcts = []
         for d in recent5:
-            r = sec_df[(sec_df['industry'] == ind) & (sec_df['date'] == d)]
+            r = sec_df[(sec_df['board_code'] == board_code) & (sec_df['date'] == d)]
             if not r.empty:
                 last_pcts.append(float(r['avg_pct'].iloc[0]))
 
         sum5 = sum(last_pcts) if last_pcts else 0
+        meta = board_meta.get(board_code, {})
 
         rotation.append({
-            'industry': ind,
+            'industry': meta.get('industry', board_code),
+            'board_code': board_code,
+            'l1': meta.get('l1', ''),
+            'l2': meta.get('l2', ''),
             'ranks': ranks,
             'rank_change': rank_change,
             'recent_rank': recent_rank,
@@ -380,7 +413,8 @@ def _detect_sector_rotation(conn, dates):
 
     rotation.sort(key=lambda x: x['rank_change'])
     rising_sectors = [r for r in rotation if r['rising'] and r['recent_rank'] <= 30]
-    falling_sectors = [r for r in rotation if r['falling'] and r['recent_rank'] >= 50]
+    falling_floor = max(50, int(len(all_boards) * 0.65))
+    falling_sectors = [r for r in rotation if r['falling'] and r['recent_rank'] >= falling_floor]
 
     return {
         'rising': rising_sectors[:5],   # 新晋强势TOP5
@@ -453,21 +487,21 @@ def _print_report(result):
     print(f"    连板高度: {cd.get('max_streak', 0)}板")
     print(f"    大涨(>5%)占比: {cd.get('big_gain_ratio', 0):.1f}%")
 
-    # ── 板块轮动 ──
+    # ── 东财三级行业轮动 ──
     sr = result.get('sector_rotation', {})
     if sr:
-        print(f"\n  ── 板块轮动预判 ──")
+        print(f"\n  ── 东财三级行业轮动预判 ──")
 
         rising = sr.get('rising', [])
         if rising:
-            print(f"  🔺 新晋强势板块（排名连续上升）:")
+            print(f"  🔺 新晋强势三级行业（排名连续上升）:")
             for r in rising[:5]:
                 ranks_str = '→'.join(str(x) for x in r['ranks'][-3:])
                 print(f"    {r['industry'][:15]:<16s} 排名{ranks_str} 5日累涨{r['sum5_pct']:+.2f}%")
 
         falling = sr.get('falling', [])
         if falling:
-            print(f"  🔻 退潮板块（排名连续下降）:")
+            print(f"  🔻 退潮三级行业（排名连续下降）:")
             for r in falling[:5]:
                 ranks_str = '→'.join(str(x) for x in r['ranks'][-3:])
                 print(f"    {r['industry'][:15]:<16s} 排名{ranks_str} 5日累涨{r['sum5_pct']:+.2f}%")

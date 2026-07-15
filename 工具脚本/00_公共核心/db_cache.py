@@ -5,19 +5,15 @@
 替代原有的 SQLite 文件缓存，接口保持不变，存储后端改为 MySQL。
 
 用法:
-    from db_cache import init_db, read_kline, upsert_kline, get_last_date, get_all_codes
+    from db_cache import init_db, get_connection, upsert_kline_batch, get_last_date
 
 数据库: MySQL stock_local (localhost:3306)
 
 表结构:
     kline_daily(code, date, open, high, low, close, volume, amount, turn, pctChg)
-    stock_industry(code, code_name, industry, industry_class, update_date)
-    sector_daily(industry, date, avg_pct, up_count, down_count, flat_count,
-                 total_amount, avg_turn, top_gainer, top_gainer_pct, stock_count)
-    concept_info(source, concept_name, concept_code, latest_pct, latest_amount, latest_rank, update_date)
-    concept_member(source, concept_name, code, code_name, update_date)
-    concept_daily(source, concept_name, date, open, high, low, close, volume,
-                  amount, amplitude, pctChg, change_amount, turn)
+    stock_industry(code, code_name, update_date)  # 股票池/名称保留表
+    em_board_l1/em_board_l2/em_board_l3/em_stock_board_l3/em_board_daily
+    trade_log(...)
     主键: 各表见建表语句
 """
 
@@ -196,56 +192,78 @@ def init_db():
             PRIMARY KEY (code)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 
-        # ═══ 行业板块每日统计表 ═══
-        """CREATE TABLE IF NOT EXISTS sector_daily (
-            industry        VARCHAR(128)  NOT NULL,
-            date            DATE          NOT NULL,
-            avg_pct         DOUBLE,
-            up_count        INT,
-            down_count      INT,
-            flat_count      INT,
-            total_amount    DOUBLE,
-            avg_turn        DOUBLE,
-            top_gainer      VARCHAR(16),
-            top_gainer_pct  DOUBLE,
-            stock_count     INT,
-            PRIMARY KEY (industry, date)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
-
-        # ═══ 概念板块基础信息表 ═══
-        """CREATE TABLE IF NOT EXISTS concept_info (
-            source          VARCHAR(32)   NOT NULL DEFAULT 'eastmoney',
-            concept_name    VARCHAR(128)  NOT NULL,
-            concept_code    VARCHAR(32),
-            latest_pct      DOUBLE,
-            latest_amount   DOUBLE,
-            latest_rank     INT,
+        # ═══ 东方财富三层行业板块：一级/二级/三级 + 个股三级绑定 ═══
+        """CREATE TABLE IF NOT EXISTS em_board_l1 (
+            id              INT          NOT NULL AUTO_INCREMENT,
+            board_code      VARCHAR(16)  NOT NULL,
+            board_name      VARCHAR(64)  NOT NULL,
+            board_market    VARCHAR(8),
+            source_index    INT,
             update_date     DATE,
-            updated_at      TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (source, concept_name),
-            KEY idx_concept_code (concept_code),
-            KEY idx_update_date (update_date)
+            updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uk_em_l1_code (board_code),
+            KEY idx_em_l1_name (board_name)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 
-        # ═══ 概念成分股映射表（一股可属于多个概念）═══
-        """CREATE TABLE IF NOT EXISTS concept_member (
-            source          VARCHAR(32)   NOT NULL DEFAULT 'eastmoney',
-            concept_name    VARCHAR(128)  NOT NULL,
-            code            VARCHAR(16)   NOT NULL,
+        """CREATE TABLE IF NOT EXISTS em_board_l2 (
+            id              INT          NOT NULL AUTO_INCREMENT,
+            l1_id           INT          NOT NULL,
+            board_code      VARCHAR(16)  NOT NULL,
+            board_name      VARCHAR(64)  NOT NULL,
+            board_market    VARCHAR(8),
+            source_index    INT,
+            update_date     DATE,
+            updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uk_em_l2_code (board_code),
+            KEY idx_em_l2_l1 (l1_id),
+            KEY idx_em_l2_name (board_name),
+            CONSTRAINT fk_em_l2_l1 FOREIGN KEY (l1_id) REFERENCES em_board_l1(id)
+                ON UPDATE CASCADE ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+
+        """CREATE TABLE IF NOT EXISTS em_board_l3 (
+            id              INT          NOT NULL AUTO_INCREMENT,
+            l1_id           INT          NOT NULL,
+            l2_id           INT          NOT NULL,
+            board_code      VARCHAR(16)  NOT NULL,
+            board_name      VARCHAR(64)  NOT NULL,
+            board_market    VARCHAR(8),
+            source_index    INT,
+            update_date     DATE,
+            updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uk_em_l3_code (board_code),
+            KEY idx_em_l3_l1 (l1_id),
+            KEY idx_em_l3_l2 (l2_id),
+            KEY idx_em_l3_name (board_name),
+            CONSTRAINT fk_em_l3_l1 FOREIGN KEY (l1_id) REFERENCES em_board_l1(id)
+                ON UPDATE CASCADE ON DELETE RESTRICT,
+            CONSTRAINT fk_em_l3_l2 FOREIGN KEY (l2_id) REFERENCES em_board_l2(id)
+                ON UPDATE CASCADE ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+
+        """CREATE TABLE IF NOT EXISTS em_stock_board_l3 (
+            code            VARCHAR(16)  NOT NULL,
             code_name       VARCHAR(64),
+            raw_code        VARCHAR(16),
+            raw_market      VARCHAR(8),
+            l3_id           INT          NOT NULL,
+            labels          VARCHAR(128),
             update_date     DATE,
-            updated_at      TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (source, concept_name, code),
-            KEY idx_code (code),
-            KEY idx_concept (source, concept_name),
-            KEY idx_update_date (update_date)
+            updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (code),
+            KEY idx_em_stock_l3 (l3_id),
+            KEY idx_em_stock_raw (raw_market, raw_code),
+            CONSTRAINT fk_em_stock_l3 FOREIGN KEY (l3_id) REFERENCES em_board_l3(id)
+                ON UPDATE CASCADE ON DELETE RESTRICT
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 
-        # ═══ 概念板块每日行情表 ═══
-        """CREATE TABLE IF NOT EXISTS concept_daily (
-            source          VARCHAR(32)   NOT NULL DEFAULT 'eastmoney',
-            concept_name    VARCHAR(128)  NOT NULL,
-            date            DATE          NOT NULL,
+        """CREATE TABLE IF NOT EXISTS em_board_daily (
+            board_code      VARCHAR(16)  NOT NULL,
+            level           TINYINT      NOT NULL,
+            date            DATE         NOT NULL,
             open            DOUBLE,
             high            DOUBLE,
             low             DOUBLE,
@@ -256,57 +274,10 @@ def init_db():
             pctChg          DOUBLE,
             change_amount   DOUBLE,
             turn            DOUBLE,
-            updated_at      TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (source, concept_name, date),
-            KEY idx_date (date),
-            KEY idx_concept_date (source, concept_name, date)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
-
-        # ═══ 申万行业三层树信息表（一级31/二级~134/三级336）═══
-        # 提供"能分级、不重叠"的行业骨架，补证监会大类(单层)与同花顺概念(扁平)之外的第三级粒度。
-        """CREATE TABLE IF NOT EXISTS sw_industry_info (
-            code            VARCHAR(16)   NOT NULL,
-            level           TINYINT       NOT NULL,
-            name            VARCHAR(64),
-            parent_name     VARCHAR(64),
-            member_count    INT,
-            pe_ttm          DOUBLE,
-            pb              DOUBLE,
-            update_date     DATE,
-            updated_at      TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (code),
-            KEY idx_level (level),
-            KEY idx_parent (parent_name)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
-
-        # ═══ 申万行业指数日K表（三级/一级指数行情，供两周轮动分析）═══
-        """CREATE TABLE IF NOT EXISTS sw_industry_daily (
-            code    VARCHAR(16)  NOT NULL,
-            date    DATE         NOT NULL,
-            open    DOUBLE,
-            high    DOUBLE,
-            low     DOUBLE,
-            close   DOUBLE,
-            volume  DOUBLE,
-            amount  DOUBLE,
-            pctChg  DOUBLE,
-            updated_at TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (code, date),
-            KEY idx_date (date)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
-
-        # ═══ 申万三级行业成分股映射表（三级→个股，供"走强三级挑主板龙头"）═══
-        # 数据来源：legulegu 成分表(akshare sw_index_third_cons 的上游)；官方 akshare 接口贴列名坏了，
-        # 取数脚本按列位置解析。成分慢变，每周刷一次即可。
-        """CREATE TABLE IF NOT EXISTS sw_industry_member (
-            l3_code     VARCHAR(16)  NOT NULL,
-            stock_code  VARCHAR(16)  NOT NULL,
-            stock_name  VARCHAR(64),
-            update_date DATE,
-            updated_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (l3_code, stock_code),
-            KEY idx_stock (stock_code),
-            KEY idx_l3 (l3_code)
+            updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (board_code, date),
+            KEY idx_em_board_daily_level_date (level, date),
+            KEY idx_em_board_daily_date (date)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 
         # ═══ 交易记录表 ═══
@@ -365,70 +336,6 @@ def init_db():
             KEY idx_trade_strategy (strategy, market_mode)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 
-        # ═══ ETF日K数据表（结构与 kline_daily 一致，code 用6位纯数字）═══
-        """CREATE TABLE IF NOT EXISTS etf_kline_daily (
-            code    VARCHAR(8)   NOT NULL,
-            date    DATE         NOT NULL,
-            open    DOUBLE,
-            high    DOUBLE,
-            low     DOUBLE,
-            close   DOUBLE,
-            volume  DOUBLE,
-            amount  DOUBLE,
-            turn    DOUBLE,
-            pctChg  DOUBLE,
-            PRIMARY KEY (code, date),
-            KEY idx_date (date)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
-
-        # ═══ ETF评分历史表（每日 screener 跑完一次落一条）═══
-        """CREATE TABLE IF NOT EXISTS etf_score_history (
-            code                VARCHAR(8)    NOT NULL,
-            date                DATE          NOT NULL,
-            mode                VARCHAR(8),
-            category            VARCHAR(32),
-            theme               VARCHAR(64),
-            name                VARCHAR(64),
-            total_score         DOUBLE,
-            safety_score        DOUBLE,
-            return_score        DOUBLE,
-            income_score        DOUBLE,
-            execution_score     DOUBLE,
-            grade               VARCHAR(4),
-            raw_grade           VARCHAR(4),
-            action              VARCHAR(64),
-            hard_filter_ok      TINYINT,
-            hard_filter_reason  VARCHAR(255),
-            reason              VARCHAR(255),
-            ma_state            VARCHAR(32),
-            return_1y           DOUBLE,
-            max_drawdown_3y     DOUBLE,
-            avg_amount_20d      DOUBLE,
-            valuation_pct_5y    DOUBLE,
-            updated_at          TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (code, date),
-            KEY idx_date (date),
-            KEY idx_grade_date (grade, date),
-            KEY idx_category_date (category, date)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
-
-        # ═══ ETF 白名单 meta 表（替代 etf_meta.csv，可被 updater 自动刷新）═══
-        """CREATE TABLE IF NOT EXISTS etf_meta (
-            code                VARCHAR(8)    NOT NULL,
-            name                VARCHAR(64),
-            style_bucket        VARCHAR(32),
-            track_index         VARCHAR(64),
-            fund_size_yi        DOUBLE,
-            fee_rate            DOUBLE,
-            tracking_error_60d  DOUBLE,
-            valuation_pct_5y    DOUBLE,
-            dividend_yield      DOUBLE,
-            payout_ratio        DOUBLE,
-            style_corr_group    VARCHAR(32),
-            notes               VARCHAR(255),
-            updated_at          TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (code)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     ]
 
     for sql in creates:
@@ -504,75 +411,6 @@ def _ensure_trade_log_columns(conn):
         conn.rollback()
 
 
-def read_kline(code, start_date=None, end_date=None):
-    """
-    读取某只股票的K线数据，返回 DataFrame。
-    code: 如 'sh.600000'
-    start_date / end_date: 可选，格式 'YYYY-MM-DD'
-    """
-    conn = get_connection()
-    sql = "SELECT date, open, high, low, close, volume, amount, turn, pctChg FROM kline_daily WHERE code = ?"
-    params = [code]
-    if start_date:
-        sql += " AND date >= ?"
-        params.append(start_date)
-    if end_date:
-        sql += " AND date <= ?"
-        params.append(end_date)
-    sql += " ORDER BY date"
-
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-
-    if df.empty:
-        return df
-
-    for col in NUMERIC_COLS:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    return df
-
-
-def upsert_kline(code, df):
-    """
-    插入或更新K线数据（自动去重，date相同则覆盖）。
-    code: 如 'sh.600000'
-    df: DataFrame，至少包含 KLINE_COLS 中的列
-    """
-    if df is None or df.empty:
-        return 0
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    inserted = 0
-    for _, row in df.iterrows():
-        cursor.execute("""
-            INSERT INTO kline_daily (code, date, open, high, low, close, volume, amount, turn, pctChg)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                open=VALUES(open), high=VALUES(high), low=VALUES(low),
-                close=VALUES(close), volume=VALUES(volume), amount=VALUES(amount),
-                turn=VALUES(turn), pctChg=VALUES(pctChg)
-        """, (
-            code,
-            str(row['date'])[:10],
-            _to_float(row.get('open')),
-            _to_float(row.get('high')),
-            _to_float(row.get('low')),
-            _to_float(row.get('close')),
-            _to_float(row.get('volume')),
-            _to_float(row.get('amount')),
-            _to_float(row.get('turn')),
-            _to_float(row.get('pctChg')),
-        ))
-        inserted += 1
-
-    conn.commit()
-    conn.close()
-    return inserted
-
-
 def upsert_kline_batch(code, df):
     """
     批量插入（比 upsert_kline 快很多，适合迁移用）。
@@ -620,27 +458,6 @@ def get_last_date(code):
     return result
 
 
-def get_all_codes():
-    """获取数据库中所有股票代码列表"""
-    conn = get_connection()
-    cursor = conn.execute("SELECT DISTINCT code FROM kline_daily ORDER BY code")
-    codes = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return codes
-
-
-def get_row_count(code=None):
-    """获取记录数。code=None 时返回总数。"""
-    conn = get_connection()
-    if code:
-        cursor = conn.execute("SELECT COUNT(*) FROM kline_daily WHERE code = ?", (code,))
-    else:
-        cursor = conn.execute("SELECT COUNT(*) FROM kline_daily")
-    result = cursor.fetchone()[0]
-    conn.close()
-    return result
-
-
 def _to_float(val):
     """安全转 float"""
     if val is None:
@@ -652,24 +469,24 @@ def _to_float(val):
 
 
 # ═══════════════════════════════════════════
-# 行业映射相关函数
+# 东方财富三层行业板块相关函数
 # ═══════════════════════════════════════════
 
-def upsert_industry(rows):
+def upsert_em_board_l1(rows):
     """
-    批量写入行业映射。
-    rows: list of (code, code_name, industry, industry_class, update_date)
+    批量写入东方财富一级行业板块。
+    rows: list of (board_code, board_name, board_market, source_index, update_date)
     """
     if not rows:
         return 0
     conn = get_connection()
     conn.executemany("""
-        INSERT INTO stock_industry (code, code_name, industry, industry_class, update_date)
+        INSERT INTO em_board_l1 (board_code, board_name, board_market, source_index, update_date)
         VALUES (%s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
-            code_name=VALUES(code_name),
-            industry=VALUES(industry),
-            industry_class=VALUES(industry_class),
+            board_name=VALUES(board_name),
+            board_market=VALUES(board_market),
+            source_index=VALUES(source_index),
             update_date=VALUES(update_date)
     """, rows)
     conn.commit()
@@ -677,118 +494,46 @@ def upsert_industry(rows):
     return len(rows)
 
 
-def get_industry_map():
-    """获取全部股票→行业映射，返回 dict: code → industry"""
-    conn = get_connection()
-    cursor = conn.execute("SELECT code, industry FROM stock_industry WHERE industry IS NOT NULL")
-    result = {row[0]: row[1] for row in cursor.fetchall()}
-    conn.close()
-    return result
-
-
-def get_industry_list():
-    """获取所有行业名称列表"""
-    conn = get_connection()
-    cursor = conn.execute("SELECT DISTINCT industry FROM stock_industry WHERE industry IS NOT NULL ORDER BY industry")
-    result = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return result
-
-
-def get_stocks_in_industry(industry):
-    """获取某个行业下所有股票代码"""
-    conn = get_connection()
-    cursor = conn.execute(
-        "SELECT code FROM stock_industry WHERE industry = ?", (industry,)
-    )
-    result = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    return result
-
-
-# ═══════════════════════════════════════════
-# 板块每日统计相关函数
-# ═══════════════════════════════════════════
-
-def upsert_sector_daily(rows):
+def upsert_em_board_l2(rows):
     """
-    批量写入板块每日统计。
-    rows: list of (industry, date, avg_pct, up_count, down_count, flat_count,
-                   total_amount, avg_turn, top_gainer, top_gainer_pct, stock_count)
+    批量写入东方财富二级行业板块。
+    rows: list of (l1_id, board_code, board_name, board_market, source_index, update_date)
     """
     if not rows:
         return 0
     conn = get_connection()
     conn.executemany("""
-        INSERT INTO sector_daily (industry, date, avg_pct, up_count, down_count,
-            flat_count, total_amount, avg_turn, top_gainer, top_gainer_pct, stock_count)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO em_board_l2 (l1_id, board_code, board_name, board_market, source_index, update_date)
+        VALUES (%s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
-            avg_pct=VALUES(avg_pct), up_count=VALUES(up_count),
-            down_count=VALUES(down_count), flat_count=VALUES(flat_count),
-            total_amount=VALUES(total_amount), avg_turn=VALUES(avg_turn),
-            top_gainer=VALUES(top_gainer), top_gainer_pct=VALUES(top_gainer_pct),
-            stock_count=VALUES(stock_count)
+            l1_id=VALUES(l1_id),
+            board_name=VALUES(board_name),
+            board_market=VALUES(board_market),
+            source_index=VALUES(source_index),
+            update_date=VALUES(update_date)
     """, rows)
     conn.commit()
     conn.close()
     return len(rows)
 
 
-def read_sector_daily(industry=None, start_date=None, end_date=None):
+def upsert_em_board_l3(rows):
     """
-    读取板块日统计数据，返回 DataFrame。
-    industry: 可选，指定行业名
-    """
-    conn = get_connection()
-    sql = "SELECT * FROM sector_daily WHERE 1=1"
-    params = []
-    if industry:
-        sql += " AND industry = ?"
-        params.append(industry)
-    if start_date:
-        sql += " AND date >= ?"
-        params.append(start_date)
-    if end_date:
-        sql += " AND date <= ?"
-        params.append(end_date)
-    sql += " ORDER BY industry, date"
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-    return df
-
-
-def get_sector_snapshot(date):
-    """获取某日所有板块的表现快照，按涨跌幅排序"""
-    conn = get_connection()
-    df = pd.read_sql_query(
-        "SELECT * FROM sector_daily WHERE date = ? ORDER BY avg_pct DESC",
-        conn, params=[date]
-    )
-    conn.close()
-    return df
-
-
-# ═══════════════════════════════════════════
-# 概念板块相关函数
-# ═══════════════════════════════════════════
-
-def upsert_concept_info(rows):
-    """
-    批量写入概念基础信息。
-    rows: list of (source, concept_name, concept_code, latest_pct,
-                   latest_amount, latest_rank, update_date)
+    批量写入东方财富三级行业板块。
+    rows: list of (l1_id, l2_id, board_code, board_name, board_market, source_index, update_date)
     """
     if not rows:
         return 0
     conn = get_connection()
     conn.executemany("""
-        INSERT INTO concept_info (source, concept_name, concept_code, latest_pct,
-            latest_amount, latest_rank, update_date)
+        INSERT INTO em_board_l3 (l1_id, l2_id, board_code, board_name, board_market, source_index, update_date)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
-            concept_code=VALUES(concept_code), latest_pct=VALUES(latest_pct),
-            latest_amount=VALUES(latest_amount), latest_rank=VALUES(latest_rank),
+            l1_id=VALUES(l1_id),
+            l2_id=VALUES(l2_id),
+            board_name=VALUES(board_name),
+            board_market=VALUES(board_market),
+            source_index=VALUES(source_index),
             update_date=VALUES(update_date)
     """, rows)
     conn.commit()
@@ -796,153 +541,80 @@ def upsert_concept_info(rows):
     return len(rows)
 
 
-def upsert_concept_daily(rows):
+def get_em_board_id_map(level):
+    """获取东方财富指定层级板块 code -> id 映射。level: 1/2/3。"""
+    table = {1: "em_board_l1", 2: "em_board_l2", 3: "em_board_l3"}.get(int(level))
+    if not table:
+        raise ValueError("level must be 1, 2, or 3")
+    conn = get_connection(readonly=True)
+    try:
+        rows = conn.execute(f"SELECT board_code, id FROM {table}").fetchall()
+        return {row[0]: row[1] for row in rows}
+    finally:
+        conn.close()
+
+
+def replace_em_stock_board_l3(rows):
     """
-    批量写入概念日行情。
-    rows: list of (source, concept_name, date, open, high, low, close,
+    替换东方财富个股→三级行业绑定。
+    rows: list of (code, code_name, raw_code, raw_market, l3_id, labels, update_date)
+    """
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM em_stock_board_l3")
+        if rows:
+            conn.executemany("""
+                INSERT INTO em_stock_board_l3 (
+                    code, code_name, raw_code, raw_market, l3_id, labels, update_date
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    code_name=VALUES(code_name),
+                    raw_code=VALUES(raw_code),
+                    raw_market=VALUES(raw_market),
+                    l3_id=VALUES(l3_id),
+                    labels=VALUES(labels),
+                    update_date=VALUES(update_date)
+            """, rows)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
+    conn.close()
+    return len(rows)
+
+
+def upsert_em_board_daily(rows):
+    """
+    批量写入东方财富三层行业板块日K。
+    rows: list of (board_code, level, date, open, high, low, close,
                    volume, amount, amplitude, pctChg, change_amount, turn)
     """
     if not rows:
         return 0
     conn = get_connection()
     conn.executemany("""
-        INSERT INTO concept_daily (source, concept_name, date, open, high, low,
-            close, volume, amount, amplitude, pctChg, change_amount, turn)
+        INSERT INTO em_board_daily (
+            board_code, level, date, open, high, low, close,
+            volume, amount, amplitude, pctChg, change_amount, turn
+        )
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
-            open=VALUES(open), high=VALUES(high), low=VALUES(low), close=VALUES(close),
-            volume=VALUES(volume), amount=VALUES(amount), amplitude=VALUES(amplitude),
-            pctChg=VALUES(pctChg), change_amount=VALUES(change_amount), turn=VALUES(turn)
+            level=VALUES(level),
+            open=VALUES(open),
+            high=VALUES(high),
+            low=VALUES(low),
+            close=VALUES(close),
+            volume=VALUES(volume),
+            amount=VALUES(amount),
+            amplitude=VALUES(amplitude),
+            pctChg=VALUES(pctChg),
+            change_amount=VALUES(change_amount),
+            turn=VALUES(turn)
     """, rows)
     conn.commit()
     conn.close()
     return len(rows)
-
-
-def replace_concept_members(source, concept_name, rows):
-    """
-    替换某个概念的当前成分股。
-    rows: list of (source, concept_name, code, code_name, update_date)
-    """
-    conn = get_connection()
-    try:
-        conn.execute(
-            "DELETE FROM concept_member WHERE source = ? AND concept_name = ?",
-            (source, concept_name)
-        )
-        if rows:
-            conn.executemany("""
-                INSERT INTO concept_member (source, concept_name, code, code_name, update_date)
-                VALUES (%s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    code_name=VALUES(code_name), update_date=VALUES(update_date)
-            """, rows)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        conn.close()
-        raise
-    conn.close()
-    return len(rows)
-
-
-def upsert_sw_industry_info(rows):
-    """
-    批量写入申万行业三层树信息。
-    rows: list of (code, level, name, parent_name, member_count, pe_ttm, pb, update_date)
-    """
-    if not rows:
-        return 0
-    conn = get_connection()
-    conn.executemany("""
-        INSERT INTO sw_industry_info (code, level, name, parent_name, member_count,
-            pe_ttm, pb, update_date)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            level=VALUES(level), name=VALUES(name), parent_name=VALUES(parent_name),
-            member_count=VALUES(member_count), pe_ttm=VALUES(pe_ttm), pb=VALUES(pb),
-            update_date=VALUES(update_date)
-    """, rows)
-    conn.commit()
-    conn.close()
-    return len(rows)
-
-
-def upsert_sw_industry_daily(rows):
-    """
-    批量写入申万行业指数日K。
-    rows: list of (code, date, open, high, low, close, volume, amount, pctChg)
-    """
-    if not rows:
-        return 0
-    conn = get_connection()
-    conn.executemany("""
-        INSERT INTO sw_industry_daily (code, date, open, high, low, close,
-            volume, amount, pctChg)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            open=VALUES(open), high=VALUES(high), low=VALUES(low), close=VALUES(close),
-            volume=VALUES(volume), amount=VALUES(amount), pctChg=VALUES(pctChg)
-    """, rows)
-    conn.commit()
-    conn.close()
-    return len(rows)
-
-
-def replace_sw_industry_member(l3_code, rows):
-    """
-    替换某个申万三级行业的成分股。
-    rows: list of (l3_code, stock_code, stock_name, update_date)
-    """
-    conn = get_connection()
-    try:
-        conn.execute("DELETE FROM sw_industry_member WHERE l3_code = ?", (l3_code,))
-        if rows:
-            conn.executemany("""
-                INSERT INTO sw_industry_member (l3_code, stock_code, stock_name, update_date)
-                VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    stock_name=VALUES(stock_name), update_date=VALUES(update_date)
-            """, rows)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        conn.close()
-        raise
-    conn.close()
-    return len(rows)
-
-
-def read_concept_daily(concept_name=None, source='eastmoney', start_date=None, end_date=None):
-    """读取概念日行情，返回 DataFrame。"""
-    conn = get_connection()
-    sql = "SELECT * FROM concept_daily WHERE source = ?"
-    params = [source]
-    if concept_name:
-        sql += " AND concept_name = ?"
-        params.append(concept_name)
-    if start_date:
-        sql += " AND date >= ?"
-        params.append(start_date)
-    if end_date:
-        sql += " AND date <= ?"
-        params.append(end_date)
-    sql += " ORDER BY concept_name, date"
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-    return df
-
-
-def get_concept_members(concept_name, source='eastmoney'):
-    """获取某个概念的当前成分股，返回 list of (code, code_name)。"""
-    conn = get_connection()
-    cursor = conn.execute(
-        "SELECT code, code_name FROM concept_member WHERE source = ? AND concept_name = ? ORDER BY code",
-        (source, concept_name)
-    )
-    result = cursor.fetchall()
-    conn.close()
-    return result
 
 
 # ═══════════════════════════════════════════
@@ -1059,332 +731,3 @@ def get_trade_stats():
     cols = ['total', 'wins', 'losses', 'avg_pnl', 'avg_win', 'avg_loss', 'total_pnl_amount', 'rule_follow', 'rule_break']
     return dict(zip(cols, row))
 
-
-# ═══════════════════════════════════════════
-# ETF K线相关函数（表 etf_kline_daily）
-# ═══════════════════════════════════════════
-
-ETF_KLINE_COLS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'turn', 'pctChg']
-
-
-def _etf_code(code) -> str:
-    """ETF 代码规范化为 6 位纯数字字符串"""
-    digits = ''.join(ch for ch in str(code) if ch.isdigit())
-    if len(digits) >= 6:
-        return digits[-6:]
-    return digits.zfill(6)
-
-
-def read_etf_kline(code, start_date=None, end_date=None):
-    """读取某只 ETF 的日K数据，返回 DataFrame（列：date, open, high, low, close, volume, amount, turn, pctChg）。"""
-    code = _etf_code(code)
-    conn = get_connection()
-    sql = "SELECT date, open, high, low, close, volume, amount, turn, pctChg FROM etf_kline_daily WHERE code = ?"
-    params = [code]
-    if start_date:
-        sql += " AND date >= ?"
-        params.append(str(start_date)[:10])
-    if end_date:
-        sql += " AND date <= ?"
-        params.append(str(end_date)[:10])
-    sql += " ORDER BY date"
-
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-
-    if df.empty:
-        return df
-
-    for col in ['open', 'high', 'low', 'close', 'volume', 'amount', 'turn', 'pctChg']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df
-
-
-def upsert_etf_kline_batch(code, df):
-    """批量写入 ETF 日K（DUPLICATE KEY UPDATE 覆盖同日数据）。"""
-    if df is None or df.empty:
-        return 0
-
-    code = _etf_code(code)
-    rows = []
-    for _, row in df.iterrows():
-        rows.append((
-            code,
-            str(row['date'])[:10],
-            _to_float(row.get('open')),
-            _to_float(row.get('high')),
-            _to_float(row.get('low')),
-            _to_float(row.get('close')),
-            _to_float(row.get('volume')),
-            _to_float(row.get('amount')),
-            _to_float(row.get('turn')),
-            _to_float(row.get('pctChg')) if 'pctChg' in row.index else _to_float(row.get('pct_chg')),
-        ))
-
-    conn = get_connection()
-    conn.executemany("""
-        INSERT INTO etf_kline_daily (code, date, open, high, low, close, volume, amount, turn, pctChg)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            open=VALUES(open), high=VALUES(high), low=VALUES(low),
-            close=VALUES(close), volume=VALUES(volume), amount=VALUES(amount),
-            turn=VALUES(turn), pctChg=VALUES(pctChg)
-    """, rows)
-    conn.commit()
-    conn.close()
-    return len(rows)
-
-
-def get_etf_last_date(code):
-    """获取某只 ETF 缓存中最新的日期（字符串 'YYYY-MM-DD'），无数据返回 None。"""
-    code = _etf_code(code)
-    conn = get_connection()
-    cur = conn.execute("SELECT MAX(date) FROM etf_kline_daily WHERE code = ?", (code,))
-    result = cur.fetchone()[0]
-    conn.close()
-    return result
-
-
-def get_all_etf_codes():
-    """获取库中所有 ETF 代码列表。"""
-    conn = get_connection()
-    cur = conn.execute("SELECT DISTINCT code FROM etf_kline_daily ORDER BY code")
-    codes = [row[0] for row in cur.fetchall()]
-    conn.close()
-    return codes
-
-
-def get_etf_row_count(code=None):
-    """获取 ETF 行情记录数。code=None 时返回总数。"""
-    conn = get_connection()
-    if code:
-        cur = conn.execute("SELECT COUNT(*) FROM etf_kline_daily WHERE code = ?", (_etf_code(code),))
-    else:
-        cur = conn.execute("SELECT COUNT(*) FROM etf_kline_daily")
-    result = cur.fetchone()[0]
-    conn.close()
-    return result
-
-
-# ═══════════════════════════════════════════
-# ETF 评分历史相关函数（表 etf_score_history）
-# ═══════════════════════════════════════════
-
-ETF_SCORE_COLS = [
-    'code', 'date', 'mode', 'category', 'theme', 'name',
-    'total_score', 'safety_score', 'return_score', 'income_score', 'execution_score',
-    'grade', 'raw_grade', 'action',
-    'hard_filter_ok', 'hard_filter_reason', 'reason',
-    'ma_state', 'return_1y', 'max_drawdown_3y', 'avg_amount_20d', 'valuation_pct_5y',
-]
-
-
-def upsert_etf_score(rows):
-    """批量写入 ETF 评分快照。rows 为 list[dict]，每条至少含 code 和 date。
-
-    同一 (code, date) 已存在时按 ON DUPLICATE KEY UPDATE 覆盖；其它字段缺失视为 NULL。
-    返回写入行数。
-    """
-    if not rows:
-        return 0
-
-    payload = []
-    for r in rows:
-        code = _etf_code(r.get('code'))
-        date = str(r.get('date') or '')[:10]
-        if not code or not date:
-            continue
-        hard_ok = r.get('hard_filter_ok')
-        if hard_ok is True:
-            hard_ok = 1
-        elif hard_ok is False:
-            hard_ok = 0
-        elif hard_ok is None:
-            hard_ok = None
-        else:
-            try:
-                hard_ok = int(hard_ok)
-            except (ValueError, TypeError):
-                hard_ok = None
-        payload.append((
-            code, date,
-            (str(r['mode'])[:8] if r.get('mode') is not None else None),
-            (str(r['category'])[:32] if r.get('category') is not None else None),
-            (str(r['theme'])[:64] if r.get('theme') is not None else None),
-            (str(r['name'])[:64] if r.get('name') is not None else None),
-            _to_float(r.get('total_score')),
-            _to_float(r.get('safety_score')),
-            _to_float(r.get('return_score')),
-            _to_float(r.get('income_score')),
-            _to_float(r.get('execution_score')),
-            (str(r['grade'])[:4] if r.get('grade') is not None else None),
-            (str(r['raw_grade'])[:4] if r.get('raw_grade') is not None else None),
-            (str(r['action'])[:64] if r.get('action') is not None else None),
-            hard_ok,
-            (str(r['hard_filter_reason'])[:255] if r.get('hard_filter_reason') else None),
-            (str(r['reason'])[:255] if r.get('reason') else None),
-            (str(r['ma_state'])[:32] if r.get('ma_state') else None),
-            _to_float(r.get('return_1y')),
-            _to_float(r.get('max_drawdown_3y')),
-            _to_float(r.get('avg_amount_20d')),
-            _to_float(r.get('valuation_pct_5y')),
-        ))
-
-    if not payload:
-        return 0
-
-    conn = get_connection()
-    conn.executemany("""
-        INSERT INTO etf_score_history (
-            code, date, mode, category, theme, name,
-            total_score, safety_score, return_score, income_score, execution_score,
-            grade, raw_grade, action,
-            hard_filter_ok, hard_filter_reason, reason,
-            ma_state, return_1y, max_drawdown_3y, avg_amount_20d, valuation_pct_5y
-        ) VALUES (%s, %s, %s, %s, %s, %s,
-                  %s, %s, %s, %s, %s,
-                  %s, %s, %s,
-                  %s, %s, %s,
-                  %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            mode=VALUES(mode), category=VALUES(category), theme=VALUES(theme), name=VALUES(name),
-            total_score=VALUES(total_score), safety_score=VALUES(safety_score),
-            return_score=VALUES(return_score), income_score=VALUES(income_score),
-            execution_score=VALUES(execution_score),
-            grade=VALUES(grade), raw_grade=VALUES(raw_grade), action=VALUES(action),
-            hard_filter_ok=VALUES(hard_filter_ok), hard_filter_reason=VALUES(hard_filter_reason),
-            reason=VALUES(reason),
-            ma_state=VALUES(ma_state), return_1y=VALUES(return_1y),
-            max_drawdown_3y=VALUES(max_drawdown_3y), avg_amount_20d=VALUES(avg_amount_20d),
-            valuation_pct_5y=VALUES(valuation_pct_5y)
-    """, payload)
-    conn.commit()
-    conn.close()
-    return len(payload)
-
-
-def read_etf_scores(code=None, start_date=None, end_date=None, grade=None, category=None, limit=None):
-    """读取 ETF 评分历史。所有过滤器都是可选的，返回 DataFrame。"""
-    conn = get_connection()
-    sql = "SELECT * FROM etf_score_history WHERE 1=1"
-    params = []
-    if code:
-        sql += " AND code = ?"
-        params.append(_etf_code(code))
-    if start_date:
-        sql += " AND date >= ?"
-        params.append(str(start_date)[:10])
-    if end_date:
-        sql += " AND date <= ?"
-        params.append(str(end_date)[:10])
-    if grade:
-        sql += " AND grade = ?"
-        params.append(grade)
-    if category:
-        sql += " AND category = ?"
-        params.append(category)
-    sql += " ORDER BY date DESC, total_score DESC"
-    if limit:
-        sql += f" LIMIT {int(limit)}"
-
-    df = pd.read_sql_query(sql, conn, params=params)
-    conn.close()
-    return df
-
-
-def get_latest_etf_score_date():
-    """获取库中最近一次评分快照日期，无数据返回 None。"""
-    conn = get_connection()
-    cur = conn.execute("SELECT MAX(date) FROM etf_score_history")
-    result = cur.fetchone()[0]
-    conn.close()
-    return result
-
-
-# ═══════════════════════════════════════════
-# ETF meta 白名单相关函数（表 etf_meta）
-# ═══════════════════════════════════════════
-
-ETF_META_COLS = [
-    'code', 'name', 'style_bucket', 'track_index',
-    'fund_size_yi', 'fee_rate', 'tracking_error_60d', 'valuation_pct_5y',
-    'dividend_yield', 'payout_ratio', 'style_corr_group', 'notes',
-]
-
-
-def upsert_etf_meta(rows, partial_update_cols=None):
-    """批量写入 ETF 白名单 meta。
-
-    rows: list[dict]，至少含 code。
-    partial_update_cols: list[str] 或 None。
-      - None：所有 ETF_META_COLS 都写（覆盖式）；
-      - 给定时仅更新这些列（其它列保留库内原值）。用于"自动 updater 只刷数值列、保留人工编辑的 style_bucket/notes 等"。
-    返回写入条数。
-    """
-    if not rows:
-        return 0
-
-    payload = []
-    for r in rows:
-        code = _etf_code(r.get('code'))
-        if not code:
-            continue
-        payload.append((
-            code,
-            (str(r['name'])[:64] if r.get('name') else None),
-            (str(r['style_bucket'])[:32] if r.get('style_bucket') else None),
-            (str(r['track_index'])[:64] if r.get('track_index') else None),
-            _to_float(r.get('fund_size_yi')),
-            _to_float(r.get('fee_rate')),
-            _to_float(r.get('tracking_error_60d')),
-            _to_float(r.get('valuation_pct_5y')),
-            _to_float(r.get('dividend_yield')),
-            _to_float(r.get('payout_ratio')),
-            (str(r['style_corr_group'])[:32] if r.get('style_corr_group') else None),
-            (str(r['notes'])[:255] if r.get('notes') else None),
-        ))
-
-    if not payload:
-        return 0
-
-    if partial_update_cols is None:
-        update_clause = ", ".join(
-            f"{c}=VALUES({c})" for c in ETF_META_COLS if c != 'code'
-        )
-    else:
-        cols = [c for c in partial_update_cols if c in ETF_META_COLS and c != 'code']
-        if not cols:
-            return 0
-        # 仅当 VALUES() 非 NULL 时更新，避免抓不到的字段把库里现有值清掉
-        update_clause = ", ".join(
-            f"{c} = COALESCE(VALUES({c}), {c})" for c in cols
-        )
-
-    conn = get_connection()
-    conn.executemany(f"""
-        INSERT INTO etf_meta (
-            code, name, style_bucket, track_index,
-            fund_size_yi, fee_rate, tracking_error_60d, valuation_pct_5y,
-            dividend_yield, payout_ratio, style_corr_group, notes
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE {update_clause}
-    """, payload)
-    conn.commit()
-    conn.close()
-    return len(payload)
-
-
-def read_etf_meta(code=None):
-    """读取 ETF meta；code=None 时返回全表。"""
-    conn = get_connection()
-    if code:
-        sql = "SELECT * FROM etf_meta WHERE code = ?"
-        df = pd.read_sql_query(sql, conn, params=[_etf_code(code)])
-    else:
-        df = pd.read_sql_query("SELECT * FROM etf_meta ORDER BY code", conn)
-    conn.close()
-    return df
-
-
-# 首次导入自动建表
-init_db()

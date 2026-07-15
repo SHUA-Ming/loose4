@@ -26,7 +26,7 @@ if str(_COMMON_DIR) not in sys.path:
     sys.path.insert(0, str(_COMMON_DIR))
 from project_paths import ensure_tool_paths
 ensure_tool_paths()
-from db_cache import get_connection, init_db
+from db_cache import get_connection
 from market_sentiment import get_cycle_phase, compute_sentiment
 import pandas as pd
 import numpy as np
@@ -92,7 +92,7 @@ def _max_date(conn, sql, params=None):
 
 
 def _check_data_freshness(conn, index_data):
-    """检查指数、个股、板块、概念数据日期是否对齐。"""
+    """检查指数、个股、东方财富三级行业数据日期是否对齐。"""
     stock_latest = _max_date(
         conn,
         """
@@ -101,46 +101,25 @@ def _check_data_freshness(conn, index_data):
         WHERE code NOT LIKE 'sh.000%' AND code NOT LIKE 'sz.399%'
         """,
     )
-    sector_latest = _max_date(conn, "SELECT MAX(date) FROM sector_daily")
-    concept_row = None
-    try:
-        concept_row = conn.execute(
-            """
-            SELECT source, MAX(date)
-            FROM concept_daily
-            GROUP BY source
-            ORDER BY MAX(date) DESC, COUNT(*) DESC
-            LIMIT 1
-            """
-        ).fetchone()
-    except Exception:
-        concept_row = None
+    em_board_latest = _max_date(conn, "SELECT MAX(date) FROM em_board_daily WHERE level = 3")
 
     index_dates = [meta.get('last_date') for meta in index_data.values() if meta.get('last_date')]
     index_latest = max(index_dates) if index_dates else None
-    concept_source = concept_row[0] if concept_row else None
-    concept_latest = concept_row[1] if concept_row else None
     warnings_list = []
 
     if stock_latest and index_latest and index_latest < stock_latest:
         warnings_list.append(
-            f"指数数据滞后：指数最新{index_latest}，个股最新{stock_latest}。先运行 `python 工具脚本/10_数据更新/_fetch_market_data.py --from {stock_latest} --skip-industry`。"
+            f"指数数据滞后：指数最新{index_latest}，个股最新{stock_latest}。先运行 `python 工具脚本/10_数据更新/_update_cache_ak.py`。"
         )
-    if stock_latest and sector_latest and sector_latest < stock_latest:
+    if stock_latest and (not em_board_latest or em_board_latest < stock_latest):
         warnings_list.append(
-            f"板块统计滞后：板块最新{sector_latest}，个股最新{stock_latest}。先运行 `python 工具脚本/10_数据更新/_fetch_market_data.py --from {stock_latest} --skip-index --skip-industry`。"
-        )
-    if stock_latest and concept_latest and concept_latest < stock_latest:
-        warnings_list.append(
-            f"概念数据滞后：{concept_source or 'concept'}最新{concept_latest}，个股最新{stock_latest}。先运行 `python 工具脚本/10_数据更新/_fetch_concept_data.py`。"
+            f"东财三级行业数据滞后：三级行业最新{em_board_latest or '无'}，个股最新{stock_latest}。先运行 `python 工具脚本/10_数据更新/_fetch_em_board_hierarchy.py`，再运行 `python 工具脚本/10_数据更新/_fetch_em_board_daily.py --days 10`。"
         )
 
     return {
         'stock_latest': stock_latest,
         'index_latest': index_latest,
-        'sector_latest': sector_latest,
-        'concept_source': concept_source,
-        'concept_latest': concept_latest,
+        'em_board_latest': em_board_latest,
         'warnings': warnings_list,
     }
 
@@ -404,8 +383,8 @@ def _print_report(mode, config, details):
 
     print()
     print("  ── 附加规则 ──")
-    print("    · 同行业硬性只推1只（最高分）")
-    print("    · 同板块取5日涨幅TOP3")
+    print("    · 同行业/同板块候选不去重，最终榜按优先级展示，上限15只")
+    print("    · 实际执行由用户按序取舍，今日最多新开2只")
     print("    · 非主力试探策略只允许A级候选，仓位按V8表缩小")
     print()
 

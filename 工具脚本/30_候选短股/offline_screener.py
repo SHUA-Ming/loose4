@@ -10,7 +10,7 @@
   - 情绪周期仓位修正(position_modifier)
   - 板块轮动加成/惩罚
   - 梯队定位(龙头/跟风/补涨)
-  - 跨策略同行业去重
+  - 跨策略合并排序，同行业/同板块不去重
     - V8 S1评分、统一止盈和概念阶段过滤
 """
 import sys, warnings, json
@@ -26,10 +26,17 @@ if str(_COMMON_DIR) not in sys.path:
     sys.path.insert(0, str(_COMMON_DIR))
 from project_paths import ensure_tool_paths
 ensure_tool_paths()
-from db_cache import get_connection, init_db
+from db_cache import get_connection
 from market_mode import get_mode_params, detect_market_mode
+try:
+    from em_board_rotation import analyze as analyze_em_board_rotation
+except Exception as exc:
+    analyze_em_board_rotation = None
+    _em_board_rotation_import_error = exc
+else:
+    _em_board_rotation_import_error = None
 from chip_cost import analyze_chip_cost, chip_entry_check
-# V12: concept_rotation/theme_family 已弃用（个股加成改走 stock_industry 行业轮动，不再依赖 concept_member）
+# V13: 个股加成统一走东方财富三级行业。
 import pandas as pd
 import numpy as np
 
@@ -58,7 +65,34 @@ if rot.get('falling'):
     print(f"  >>> 🔻 退潮板块: {', '.join(s['industry'][:8] for s in rot['falling'][:3])}")
 print()
 
-conn = get_connection(readonly=True)  # 纯查询脚本：只读连接，不开长事务、不建表
+class _LazyReadConn:
+    """Delay DB connection until the script actually queries data."""
+
+    def __init__(self):
+        self._inner = None
+
+    def _get(self):
+        if self._inner is None:
+            self._inner = get_connection(readonly=True)
+        return self._inner
+
+    @property
+    def _conn(self):
+        return self._get()._conn
+
+    def execute(self, *args, **kwargs):
+        return self._get().execute(*args, **kwargs)
+
+    def close(self):
+        if self._inner is not None:
+            self._inner.close()
+            self._inner = None
+
+    def __getattr__(self, name):
+        return getattr(self._get(), name)
+
+
+conn = _LazyReadConn()
 
 # ═══ 历史数据驱动的入场/止盈/止损计算 ═══
 
@@ -88,6 +122,14 @@ def _role_label(role):
     return {'primary': '🟢主力', 'secondary': '🔵辅助', 'trial': '🟡试探', 'watchonly': '👀观察', 'disabled': '⛔禁用'}.get(role, role)
 
 
+def _downgrade_position_fraction(pos_text):
+    ladder = ['1/4', '1/8', '1/12', '1/16', '1/20', '1/24']
+    if pos_text in ladder:
+        idx = min(ladder.index(pos_text) + 1, len(ladder) - 1)
+        return ladder[idx]
+    return pos_text
+
+
 def _position_for_candidate(candidate, pos_mod=1.0):
     if pos_mod == 0:
         return '禁止开仓'
@@ -96,9 +138,13 @@ def _position_for_candidate(candidate, pos_mod=1.0):
     base_pos = pos_cfg.get(key, '1/4' if candidate.get('grade') == 'A' else '1/8')
     role = MODE['strategies'].get(candidate.get('strategy', 'S1'), 'disabled')
     note = _role_label(role)
+    downgrade_note = ''
+    if candidate.get('tomorrow_bucket') == TOMORROW_DOWNGRADE:
+        base_pos = _downgrade_position_fraction(base_pos)
+        downgrade_note = '\uff0c\u660e\u65e5\u884c\u4e1a\u964d\u6743'
     if pos_mod < 1:
-        return f"{base_pos}×{pos_mod:g}（{note}，情绪修正）"
-    return f"{base_pos}（{note}）"
+        return f"{base_pos}×{pos_mod:g}（{note}，情绪修正{downgrade_note}）"
+    return f"{base_pos}（{note}{downgrade_note}）"
 
 
 def _sector_cutoff_for(strategy):
@@ -400,14 +446,40 @@ def _boom_tier(code):
 
 _BOOM_LABEL = {1: '🟢T1', 2: '🟡T2', 3: '⚪T3', 4: '🔴T4', None: '·'}
 
-# === 加载行业映射和板块数据 ===
+# === 加载东方财富三级行业映射和板块数据 ===
 industry_map = {}
-sector_momentum = {}  # industry → 5日动量
+industry_code_map = {}
+industry_l1_map = {}
+industry_l2_map = {}
+sector_momentum = {}  # 东财三级行业 → 5日动量
+sector_rank = {}
 try:
-    ind_df = pd.read_sql('SELECT code, industry FROM stock_industry', conn)
+    ind_df = pd.read_sql("""
+        SELECT s.code,
+               l3.board_code AS l3_code,
+               l3.board_name AS industry,
+               l2.board_name AS l2_name,
+               l1.board_name AS l1_name
+        FROM em_stock_board_l3 s
+        JOIN em_board_l3 l3 ON s.l3_id = l3.id
+        JOIN em_board_l2 l2 ON l3.l2_id = l2.id
+        JOIN em_board_l1 l1 ON l3.l1_id = l1.id
+    """, conn)
     industry_map = dict(zip(ind_df['code'], ind_df['industry']))
+    industry_code_map = dict(zip(ind_df['code'], ind_df['l3_code']))
+    industry_l1_map = dict(zip(ind_df['code'], ind_df['l1_name']))
+    industry_l2_map = dict(zip(ind_df['code'], ind_df['l2_name']))
     # 计算最新日板块5日动量排名
-    sec_df = pd.read_sql('SELECT * FROM sector_daily ORDER BY industry, date', conn)
+    sec_df = pd.read_sql("""
+        SELECT d.board_code,
+               l3.board_name AS industry,
+               d.date,
+               d.pctChg AS avg_pct
+        FROM em_board_daily d
+        JOIN em_board_l3 l3 ON d.board_code = l3.board_code
+        WHERE d.level = 3
+        ORDER BY d.board_code, d.date
+    """, conn)
     for col in ['avg_pct']:
         sec_df[col] = pd.to_numeric(sec_df[col], errors='coerce')
     for ind, grp in sec_df.groupby('industry'):
@@ -422,14 +494,14 @@ try:
         sector_rank = {}
         for i, (ind, _) in enumerate(sorted_secs):
             sector_rank[ind] = i / max(n_sec - 1, 1)
-        print(f"  板块数据: {len(industry_map)} 只股票映射, {len(sector_momentum)} 个板块有动量数据")
+        print(f"  东财三级行业: {len(industry_map)} 只股票映射, {len(sector_momentum)} 个三级行业有动量数据")
         # 显示前5/后5板块
-        print(f"  强势板块TOP5: {', '.join(ind for ind, _ in sorted_secs[-5:])}")
-        print(f"  弱势板块TOP5: {', '.join(ind for ind, _ in sorted_secs[:5])}")
+        print(f"  强势三级TOP5: {', '.join(ind for ind, _ in sorted_secs[-5:])}")
+        print(f"  弱势三级TOP5: {', '.join(ind for ind, _ in sorted_secs[:5])}")
     else:
         sector_rank = {}
 except Exception as e:
-    print(f"  板块数据加载失败: {e}")
+    print(f"  东财三级行业数据加载失败: {e}")
     sector_rank = {}
 
 # === V6.1: 梯队定位 - 计算每只股票在板块内的5日涨幅排名 ===
@@ -438,9 +510,10 @@ try:
     # 批量取所有股票最近6天收盘价
     latest_date = conn.execute("SELECT MAX(date) FROM kline_daily WHERE code NOT LIKE 'sh.000%' AND code NOT LIKE 'sz.399%'").fetchone()[0]
     tier_sql = """
-        SELECT k.code, k.date, k.close, si.industry
+        SELECT k.code, k.date, k.close, l3.board_name AS industry
         FROM kline_daily k
-        JOIN stock_industry si ON k.code = si.code
+        JOIN em_stock_board_l3 sb ON k.code = sb.code
+        JOIN em_board_l3 l3 ON sb.l3_id = l3.id
         WHERE k.date >= (SELECT DISTINCT date FROM kline_daily WHERE code='sh.000001' ORDER BY date DESC LIMIT 1 OFFSET 5)
         AND k.code NOT LIKE 'sh.000%' AND k.code NOT LIKE 'sz.399%'
         ORDER BY k.code, k.date
@@ -485,9 +558,70 @@ for s in rot.get('rising', []):
 for s in rot.get('falling', []):
     rotation_falling.add(s.get('industry', ''))
 
-# === V12: 板块归属退化为行业轮动（弃 concept_member，改走可靠的 sector_daily 行业强度）===
-# 个股加成不再依赖稀疏/脏的 concept_member，改由所属行业的轮动强度推导。
-# 行业轮动信号 = market_mode 的 sector_rotation(rotation_rising/falling) + 本脚本 sector_rank(5日动量分位)。
+TOMORROW_PRIORITY = "\u660e\u65e5\u4f18\u5148"
+TOMORROW_DOWNGRADE = "\u964d\u6743\u884c\u4e1a"
+TOMORROW_BAN = "\u7981\u5165\u884c\u4e1a"
+TOMORROW_UNKNOWN = "\u672a\u5206\u7ea7"
+
+
+def _load_tomorrow_rotation_plan():
+    plan = {}
+    if analyze_em_board_rotation is None:
+        print(f"  \u660e\u65e5\u4e09\u7ea7\u884c\u4e1a\u9884\u6848: \u672a\u52a0\u8f7d em_board_rotation ({_em_board_rotation_import_error})")
+        return plan
+    try:
+        result = analyze_em_board_rotation(window=10, lookback=45, with_leaders=False)
+    except Exception as exc:
+        print(f"  \u660e\u65e5\u4e09\u7ea7\u884c\u4e1a\u9884\u6848: \u8ba1\u7b97\u5931\u8d25 ({exc})")
+        return plan
+    if result.get("error"):
+        print(f"  \u660e\u65e5\u4e09\u7ea7\u884c\u4e1a\u9884\u6848: {result['error']}")
+        return plan
+
+    groups = [
+        ("tomorrow_priority", TOMORROW_PRIORITY, 1),
+        ("tomorrow_downgrade", TOMORROW_DOWNGRADE, -1),
+        ("tomorrow_ban", TOMORROW_BAN, -99),
+    ]
+    for key, bucket, bonus in groups:
+        for item in result.get(key, []):
+            name = item.get("name") or item.get("industry") or ""
+            if not name:
+                continue
+            plan[name] = {
+                "bucket": bucket,
+                "bonus": bonus,
+                "reason": item.get("tomorrow_reason", ""),
+                "score": item.get("score", 0),
+                "stage": item.get("stage", ""),
+                "cum10": item.get("cum10", 0),
+                "cumB": item.get("cumB", 0),
+            }
+
+    pri = result.get("tomorrow_priority", [])
+    down = result.get("tomorrow_downgrade", [])
+    ban = result.get("tomorrow_ban", [])
+    print(
+        f"  \u660e\u65e5\u4e09\u7ea7\u884c\u4e1a\u9884\u6848: "
+        f"\u4f18\u5148{len(pri)} / \u964d\u6743{len(down)} / \u7981\u5165{len(ban)}"
+    )
+    if pri:
+        print("  \u660e\u65e5\u4f18\u5148TOP5: " + ", ".join(x["name"][:8] for x in pri[:5]))
+    if ban:
+        print("  \u7981\u5165\u884c\u4e1aTOP5: " + ", ".join(x["name"][:8] for x in ban[:5]))
+    return plan
+
+
+tomorrow_rotation_by_industry = _load_tomorrow_rotation_plan()
+
+
+def _tomorrow_policy_for_industry(ind):
+    default = {"bucket": TOMORROW_UNKNOWN, "bonus": 0, "reason": "", "score": 0, "stage": "", "cum10": 0, "cumB": 0}
+    return tomorrow_rotation_by_industry.get(ind or "", default)
+
+# === V13: 板块归属统一为东方财富三级行业（弃 concept/sector/申万主流程）===
+# 个股加成由所属东财三级行业的轮动强度推导：
+# market_mode 的 sector_rotation(现为东财三级) + 本脚本 sector_rank(5日动量分位)。
 CONCEPT_HARD_EXCLUDE = set()  # 行业模式不按概念阶段硬排除；退潮由 rot_bonus -1 体现
 
 
@@ -512,19 +646,37 @@ def _load_industry_stage_by_code():
     meta_by_code = {}
     try:
         rows = conn.execute(
-            "SELECT code, industry FROM stock_industry WHERE industry IS NOT NULL"
+            """
+            SELECT s.code,
+                   l3.board_name AS industry,
+                   l3.board_code AS l3_code,
+                   l2.board_name AS l2_name,
+                   l1.board_name AS l1_name
+            FROM em_stock_board_l3 s
+            JOIN em_board_l3 l3 ON s.l3_id = l3.id
+            JOIN em_board_l2 l2 ON l3.l2_id = l2.id
+            JOIN em_board_l1 l1 ON l3.l1_id = l1.id
+            """
         ).fetchall()
     except Exception as exc:
-        print(f"  行业轮动: 读取 stock_industry 失败 ({exc})，跳过行业加成")
+        print(f"  东财三级行业轮动: 读取 em_stock_board_l3 失败 ({exc})，跳过行业加成")
         return meta_by_code
     graded = 0
-    for code, ind in rows:
+    for code, ind, l3_code, l2_name, l1_name in rows:
         stage, bonus = _industry_stage_bonus(ind)
+        tomorrow_policy = _tomorrow_policy_for_industry(ind)
         meta_by_code[code] = {
             'concept_name': ind or '',
             'concept_stage': stage,
             'concept_bonus': bonus,
             'concept_score': round(sector_rank.get(ind, 0.5) * 100, 1),
+            'tomorrow_bucket': tomorrow_policy.get('bucket', TOMORROW_UNKNOWN),
+            'tomorrow_bonus': tomorrow_policy.get('bonus', 0),
+            'tomorrow_reason': tomorrow_policy.get('reason', ''),
+            'tomorrow_score': tomorrow_policy.get('score', 0),
+            'concept_board_code': l3_code or '',
+            'concept_l1': l1_name or '',
+            'concept_l2': l2_name or '',
             'family': '',
             'family_status': '',
             'family_active_days20': 0,
@@ -532,14 +684,13 @@ def _load_industry_stage_by_code():
         }
         if bonus > 0:
             graded += 1
-    print(f"  行业轮动: {len(meta_by_code)} 只股票映射行业阶段，其中 {graded} 只处上升/强势行业(加成>0)")
+    print(f"  东财三级行业轮动: {len(meta_by_code)} 只股票映射行业阶段，其中 {graded} 只处上升/强势三级行业(加成>0)")
     return meta_by_code
 
 
 concept_stage_by_code = _load_industry_stage_by_code()
 
-# 产业链家族加成（V11）已随 concept_member 一并弃用：家族归属同样依赖脏的 concept_member，
-# 其"持续主线"语义已由行业轮动的 '持续主线' 档(上升轮动且 sector_rank≥0.8, +2)承接。
+# 产业链家族加成字段保留为空；"持续主线"语义由东方财富三级行业轮动档承接。
 
 def _concept_meta(code):
     return concept_stage_by_code.get(code, {
@@ -547,6 +698,13 @@ def _concept_meta(code):
         'concept_stage': '—',
         'concept_bonus': 0,
         'concept_score': 0,
+        'tomorrow_bucket': TOMORROW_UNKNOWN,
+        'tomorrow_bonus': 0,
+        'tomorrow_reason': '',
+        'tomorrow_score': 0,
+        'concept_board_code': '',
+        'concept_l1': '',
+        'concept_l2': '',
         'family': '',
         'family_status': '',
         'family_active_days20': 0,
@@ -555,7 +713,10 @@ def _concept_meta(code):
 
 
 def _concept_blocked(concept_meta):
-    return concept_meta.get('concept_stage') in CONCEPT_HARD_EXCLUDE
+    return (
+        concept_meta.get('concept_stage') in CONCEPT_HARD_EXCLUDE
+        or concept_meta.get('tomorrow_bucket') == TOMORROW_BAN
+    )
 
 # === 大盘环境 ===
 print("=" * 80)
@@ -686,6 +847,7 @@ for code in (tradeable_codes if s1_role != 'disabled' else []):
     if _concept_blocked(concept_meta):
         continue
     concept_bonus = concept_meta.get('concept_bonus', 0)
+    tomorrow_bonus = concept_meta.get('tomorrow_bonus', 0)
 
     # V8新增排除项：放量滞涨、缩量假反弹、逼近套牢密集区
     vol_stall = False
@@ -792,7 +954,7 @@ for code in (tradeable_codes if s1_role != 'disabled' else []):
     if grade == 'A' or (grade == 'B' and s1_role != 'trial'):
         recent_low5 = float(np.min(los[-5:]))
         base_score = score
-        rank_score = base_score + rot_bonus + concept_bonus
+        rank_score = base_score + rot_bonus + concept_bonus + tomorrow_bonus
         results.append({
             'code': code, 'price': last, 'score': rank_score, 'base_score': base_score, 'grade': grade,
             'details': ' '.join(details),
@@ -1004,8 +1166,9 @@ for code in (tradeable_codes if s2_role != 'disabled' else []):
         if _concept_blocked(concept_meta):
             continue
         concept_bonus = concept_meta.get('concept_bonus', 0)
+        tomorrow_bonus = concept_meta.get('tomorrow_bonus', 0)
         base_score = score
-        rank_score = base_score + rot_bonus + concept_bonus
+        rank_score = base_score + rot_bonus + concept_bonus + tomorrow_bonus
         s2_results.append({
             'code': code, 'price': last, 'score': rank_score, 'base_score': base_score, 'grade': grade,
             'details': ' '.join(details),
@@ -1188,8 +1351,9 @@ for code in (tradeable_codes if s3_role != 'disabled' else []):
         tier_rank = t_info.get('rank_pct', 0.5)
         rot_bonus = 1 if ind in rotation_rising else (-1 if ind in rotation_falling else 0)
         concept_bonus = concept_meta.get('concept_bonus', 0)  # concept_meta 已在 X1 前取
+        tomorrow_bonus = concept_meta.get('tomorrow_bonus', 0)
         base_score = score
-        rank_score = base_score + rot_bonus + concept_bonus
+        rank_score = base_score + rot_bonus + concept_bonus + tomorrow_bonus
         s3_results.append({
             'code': code, 'price': last, 'score': rank_score, 'base_score': base_score, 'grade': grade,
             'details': ' '.join(details),
@@ -1252,9 +1416,7 @@ else:
 
 s4_role = MODE['strategies'].get('S4', 'disabled')
 s4_cutoff = _sector_cutoff_for('S4')
-# V12对齐修复：concept_stage 现由 _industry_stage_bonus 产出，取值只有
-# 持续主线/上升轮动/强势板块/退潮/普通轮动/—。旧白名单(主线/主线分歧/新晋发酵/强势观察)
-# 来自已弃用的 concept_rotation，与新档位零交集，曾导致 S4 恒空(死代码)。改放行三档强势行业。
+# V12对齐修复：concept_stage 现由 _industry_stage_bonus 产出，只放行三档强势行业。
 s4_allowed_stages = {'持续主线', '上升轮动', '强势板块'}
 
 print()
@@ -1403,8 +1565,9 @@ for code in (tradeable_codes if s4_role != 'disabled' else []):
     if grade == 'A' or (grade == 'B' and s4_role != 'trial'):
         rot_bonus = 1 if ind in rotation_rising else (-1 if ind in rotation_falling else 0)
         concept_bonus = concept_meta.get('concept_bonus', 0)
+        tomorrow_bonus = concept_meta.get('tomorrow_bonus', 0)
         base_score = score
-        rank_score = base_score + rot_bonus + concept_bonus
+        rank_score = base_score + rot_bonus + concept_bonus + tomorrow_bonus
         s4_results.append({
             'code': code, 'price': last, 'score': rank_score, 'base_score': base_score, 'grade': grade,
             'details': ' '.join(details),
@@ -1462,11 +1625,11 @@ else:
     print("  （无符合条件的S4主线趋势候选）")
 
 # ═══════════════════════════════════════════════════════════════
-# V6.1: 跨策略同行业去重 + 仓位修正 + 最终推荐
+# V6.1/V12: 跨策略合并排序 + 仓位修正 + 最终推荐
 # ═══════════════════════════════════════════════════════════════
 print()
 print("=" * 80)
-print("  V10主线趋势版 最终推荐（同行业去重 + 仓位修正）")
+print("  V10主线趋势版 最终推荐（同行业不去重 + 仓位修正）")
 print("=" * 80)
 
 # 合并所有候选
@@ -1486,6 +1649,18 @@ for r in s4_results:
 concept_priority_order = {'持续主线': 0, '上升轮动': 1, '强势板块': 2, '普通轮动': 3, '退潮': 4}
 def get_concept_priority(c):
     return concept_priority_order.get(c.get('concept_stage', '—'), 9)
+
+tomorrow_priority_order = {TOMORROW_PRIORITY: 0, TOMORROW_DOWNGRADE: 1, TOMORROW_UNKNOWN: 2, TOMORROW_BAN: 9}
+def get_tomorrow_priority(c):
+    return tomorrow_priority_order.get(c.get('tomorrow_bucket', TOMORROW_UNKNOWN), 2)
+
+def _tomorrow_bucket_short(c):
+    return {
+        TOMORROW_PRIORITY: "\u4f18\u5148",
+        TOMORROW_DOWNGRADE: "\u964d\u6743",
+        TOMORROW_BAN: "\u7981\u5165",
+        TOMORROW_UNKNOWN: "\u2014",
+    }.get(c.get('tomorrow_bucket', TOMORROW_UNKNOWN), "\u2014")
 
 def get_mainline_bias(c):
     return 0 if c.get('strategy') == 'S4' and get_concept_priority(c) <= 2 else 1
@@ -1508,9 +1683,9 @@ def get_boom_priority(c):            # 越小越靠前：T1 > T2 > 中性/T3 > T
 def _boom_score_band(c):            # 分数分档：|差|≤BAND 视为同档，让"相近分"并列
     return -(round(c['score'] / BOOM_SCORE_BAND))
 def _merge_sort_key(x, boom):
-    # 前段(可买>策略>概念>主线>龙头)与原逻辑完全一致；景气仅在"同龙头、相近分"内插队
+    # 前段优先级: 买点状态 > 策略角色 > 明日行业档 > 概念阶段 > 主线 > 龙头；景气仅在"同龙头、相近分"内插队
     head = (buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x),
-            get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier') == '龙头' else 1)
+            get_tomorrow_priority(x), get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier') == '龙头' else 1)
     if boom:
         return head + (_boom_score_band(x), get_boom_priority(x), -x['score'])
     return head + (-x['score'],)   # boom 关闭 → 与改动前逐字节等价
@@ -1530,8 +1705,8 @@ if pos_mod < 1.0:
 
 if dedup_results:
     print(f"\n  候选推荐: {len(dedup_results)} 只 (按优先级排序,同行业不去重,同板块多票按序自行取舍)")
-    print(f"  {'排名':>4s} {'策略':>4s} {'代码':<12s} {'价格':>7s} {'评分':>6s} {'梯队':>4s} {'景气':>4s} {'板块':>12s} {'概念阶段':>10s} {'买点/仓位'}")
-    print("-" * 115)
+    print(f"  {'排名':>4s} {'策略':>4s} {'代码':<12s} {'价格':>7s} {'评分':>6s} {'梯队':>4s} {'景气':>4s} {'板块':>12s} {'明日档':>6s} {'概念阶段':>10s} {'买点/仓位'}")
+    print("-" * 125)
     for rank, c in enumerate(dedup_results[:15], 1):
         tier_tag = c.get('tier', '—')
         rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
@@ -1548,9 +1723,10 @@ if dedup_results:
         concept_text = c.get('concept_stage', '—')
         if c.get('concept_name'):
             concept_text = f"{concept_text}:{c['concept_name'][:6]}"
+        tomorrow_text = _tomorrow_bucket_short(c)
         fam = c.get('family', '')
         fam_tag = f" 〔{fam}·{c.get('family_status','')}{c.get('family_active_days20',0)}/20〕" if fam else ''
-        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {c.get('boom_label','·'):>4s} {ind_short:>12s}{rot_tag} {concept_text:>10s}{fam_tag}  {advice}")
+        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {c.get('boom_label','·'):>4s} {ind_short:>12s}{rot_tag} {tomorrow_text:>6s} {concept_text:>10s}{fam_tag}  {advice}")
 else:
     print("\n  （无最终推荐候选）")
 

@@ -3,7 +3,7 @@
 """
 新浪日K线接口封装 —— 替代 baostock.query_history_k_data_plus
 
-被 market_top_down / batch_fetch / cn_stock_analysis 等脚本复用。
+被 market_top_down、数据更新脚本和个股分析流程复用。
 不依赖 baostock，直接走新浪 HTTP 接口（无需代理）。
 
 限制说明:

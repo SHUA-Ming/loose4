@@ -16,7 +16,14 @@
 import argparse
 import datetime as dt
 import sys
+import warnings
 from pathlib import Path
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy.*")
 
 _COMMON_DIR = Path(__file__).resolve().parents[1] / "00_公共核心"
 if str(_COMMON_DIR) not in sys.path:
@@ -28,7 +35,7 @@ from db_cache import add_trade, close_trade, get_connection, get_open_trades, ge
 
 # 当前系统版本号：每次改动选股/风控/情绪逻辑就 +1，并在《交易体系/系统变更日志.md》记一条。
 # buy 不显式传 --sysver 时自动打这个版本，保证每笔都带版本、月末能按版本分段校准。
-CURRENT_SYSVER = 'v2'
+CURRENT_SYSVER = 'v5'
 
 
 def today_str():
@@ -82,6 +89,103 @@ def pct_text(value):
         return str(value)
 
 
+def _is_blank(value):
+    if value is None:
+        return True
+    try:
+        if value != value:  # NaN
+            return True
+    except Exception:
+        pass
+    return str(value).strip() == ''
+
+
+def _validate_buy_args(args):
+    """新买入必须带完整交易计划；历史补录可显式 --force 绕过。"""
+    if args.force:
+        return True
+    missing = []
+    checks = [
+        ('strategy', args.strategy, '--strategy 策略'),
+        ('market_mode', args.market_mode, '--market-mode 市场M档'),
+        ('entry', args.entry, '--entry 买入区间'),
+        ('stop', args.stop, '--stop 硬止损'),
+        ('soft_stop', args.soft_stop, '--soft-stop 软止损'),
+        ('pos', args.pos, '--pos 仓位'),
+        ('confidence', args.confidence, '--confidence 置信度'),
+        ('invalidation', args.invalidation, '--invalidation 反证/逻辑失效条件'),
+    ]
+    for _key, value, label in checks:
+        if _key == 'entry':
+            if not value or len(value) != 2:
+                missing.append(label)
+        elif _key == 'pos':
+            if _is_blank(value) or parse_position(value) is None:
+                missing.append(label)
+        elif _is_blank(value):
+            missing.append(label)
+    if not missing:
+        return True
+    print("买入记录被拦截：缺少完整交易计划。")
+    print("缺失字段：")
+    for item in missing:
+        print(f"  - {item}")
+    print("如只是补录历史/拆分仓位，请加 --force，并在 --remark 说明原因。")
+    return False
+
+
+def _load_trade_dates():
+    conn = get_connection(readonly=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT date
+            FROM kline_daily
+            WHERE code='sh.000001'
+            ORDER BY date
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(row[0])[:10] for row in rows if row and row[0]]
+
+
+def _trading_age(buy_date, trade_dates):
+    if _is_blank(buy_date) or not trade_dates:
+        return None
+    b = str(buy_date)[:10]
+    start_idx = None
+    for idx, d in enumerate(trade_dates):
+        if d >= b:
+            start_idx = idx
+            break
+    if start_idx is None:
+        return None
+    return max(0, len(trade_dates) - 1 - start_idx)
+
+
+def _infer_horizon(row):
+    parts = []
+    for col in ('expected_horizon', 'plan_source', 'mode', 'remark', 'buy_status'):
+        if col in row and not _is_blank(row[col]):
+            parts.append(str(row[col]))
+    text = ' '.join(parts)
+    if 'D3' in text or '方案B' in text or '收盘选股' in text:
+        return 3
+    if 'D2' in text or '方案A' in text or '方案C' in text or '盘后' in text or '尾盘' in text:
+        return 2
+    return None
+
+
+def _current_mode_snapshot():
+    try:
+        from market_mode import get_mode_params
+        mode = get_mode_params()
+        return mode.get('mode'), mode.get('cycle_phase'), None
+    except Exception as exc:
+        return None, None, str(exc)
+
+
 def cmd_init(_args):
     init_db()
     print("OK: trade_log 表已就绪。")
@@ -89,6 +193,8 @@ def cmd_init(_args):
 
 
 def cmd_buy(args):
+    if not _validate_buy_args(args):
+        sys.exit(2)
     init_db()
     buy_date = args.date or today_str()
     entry_low = args.entry[0] if args.entry else None
@@ -168,6 +274,69 @@ def cmd_open(_args):
     ]
     cols = [col for col in cols if col in df.columns]
     print(df[cols].to_string(index=False))
+
+
+def cmd_audit_open(_args):
+    init_db()
+    df = get_open_trades()
+    if df.empty:
+        print("当前无持仓记录。")
+        return
+
+    trade_dates = _load_trade_dates()
+    latest_trade_date = trade_dates[-1] if trade_dates else today_str()
+    current_mode, current_phase, mode_error = _current_mode_snapshot()
+    print(f"持仓审计  数据最新交易日={latest_trade_date}")
+    if mode_error:
+        print(f"当前M档读取失败：{mode_error}")
+    else:
+        print(f"当前市场环境：{current_mode or '-'} / {current_phase or '-'}")
+
+    required_cols = [
+        ('strategy', '策略'),
+        ('market_mode', '买入M档'),
+        ('entry_low', '买入区下沿'),
+        ('entry_high', '买入区上沿'),
+        ('stop_price', '硬止损'),
+        ('soft_stop', '软止损'),
+        ('position', '仓位'),
+        ('confidence_level', '置信度'),
+        ('invalidation_condition', '反证条件'),
+    ]
+
+    total_issues = 0
+    for _, row in df.iterrows():
+        issues = []
+        missing = [label for col, label in required_cols if col not in row or _is_blank(row[col])]
+        if missing:
+            issues.append("缺字段: " + "/".join(missing))
+
+        age = _trading_age(row.get('buy_date'), trade_dates)
+        horizon = _infer_horizon(row)
+        if horizon is not None and age is not None and age >= horizon:
+            issues.append(f"D{horizon}到期: 已持有D{age}")
+        elif horizon is None and age is not None and age >= 2:
+            issues.append(f"未写D2/D3周期: 已持有D{age}, 需人工确认是否到期")
+
+        row_mode = str(row.get('market_mode') or row.get('mode') or '').strip()
+        if row_mode == 'M5':
+            issues.append("买入环境为M5")
+        if current_mode == 'M5':
+            issues.append("当前环境M5, 只处理风险不开新仓")
+
+        if not issues:
+            continue
+
+        total_issues += 1
+        print()
+        print(f"ID={row.get('id')} {row.get('code')} {row.get('name')}  买入={row.get('buy_date')}@{money_text(row.get('buy_price'))}")
+        for issue in issues:
+            print(f"  - {issue}")
+
+    if total_issues == 0:
+        print("审计通过：当前持仓未发现缺计划、到期或M5环境风险。")
+    else:
+        print(f"\n审计完成：{total_issues} 条持仓需要处理/补字段。")
 
 
 def cmd_history(args):
@@ -305,6 +474,7 @@ def build_parser():
     buy_parser.add_argument('--date', help='买入日期 YYYY-MM-DD')
     buy_parser.add_argument('--remark', default='', help='备注')
     buy_parser.add_argument('--sysver', default=CURRENT_SYSVER, help=f'系统版本号，默认当前 {CURRENT_SYSVER}（改逻辑后 bump CURRENT_SYSVER 即可）')
+    buy_parser.add_argument('--force', action='store_true', help='仅用于历史补录/拆分仓位；跳过完整交易计划校验')
     buy_parser.set_defaults(func=cmd_buy)
 
     sell_parser = sub.add_parser('sell', help='记录卖出/平仓')
@@ -318,6 +488,9 @@ def build_parser():
 
     open_parser = sub.add_parser('open', help='查看当前未平仓记录')
     open_parser.set_defaults(func=cmd_open)
+
+    audit_parser = sub.add_parser('audit-open', help='审计当前持仓缺字段、D2/D3到期和M5风险')
+    audit_parser.set_defaults(func=cmd_audit_open)
 
     history_parser = sub.add_parser('history', help='查看最近交易记录')
     history_parser.add_argument('-n', type=int, default=20, help='显示条数')
