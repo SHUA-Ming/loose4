@@ -117,11 +117,13 @@ def normalize_stock_code(raw_market, raw_code):
     code = "".join(ch for ch in str(raw_code) if ch.isdigit())
     if len(code) != 6:
         return ""
-    if raw_market == "1" or code.startswith(("6", "9")):
+    if raw_market == "1" or code.startswith("6"):
         return f"sh.{code}"
     if code.startswith(("0", "2", "3")):
         return f"sz.{code}"
-    if code.startswith(("4", "8")):
+    # 北交所新旧代码段：4/8以及2024年启用的920xxx。
+    # 上海B股900xxx的 raw_market=1，已在上方优先归入上海。
+    if code.startswith(("4", "8", "9")):
         return f"bj.{code}"
     return f"{raw_market}.{code}"
 

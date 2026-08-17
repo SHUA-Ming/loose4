@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "name": "技术主线狙击池",
+  "description": "板块优先制的初始焦点池。半导体按二级行业全纳入；光模块及相关AI硬件按三级行业精确纳入。",
+  "l2": [
+    "半导体"
+  ],
+  "l3": [
+    "通信网络设备及器件",
+    "印制电路板",
+    "电子化学品Ⅲ",
+    "消费电子零部件及组装"
+  ],
+  "m5_exception": {
+    "allowed_cycle_phases": [
+      "退潮",
+      "冰点",
+      "分歧",
+      "未知"
+    ],
+    "allowed_tomorrow_buckets": [
+      "明日优先",
+      "降权行业"
+    ],
+    "allowed_grades": [
+      "A"
+    ],
+    "allowed_tiers": [
+      "龙头"
+    ],
+    "allowed_buy_status": [
+      "可买"
+    ],
+    "min_sector_daily_rank_pct": 0.9,
+    "min_sector_daily_pct": 0.0,
+    "min_excess_vs_index_pct": 2.0,
+    "min_amount_ratio_20": 1.2,
+    "min_sector_breadth": 0.55,
+    "min_sector_up_count": 3,
+    "priority_position": "1/12",
+    "downgrade_position": "1/16",
+    "max_new_positions": 1,
+    "max_same_l3_positions": 1,
+    "max_total_focus_exposure": "1/4"
+  }
+}

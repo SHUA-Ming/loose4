@@ -79,7 +79,13 @@ def compute_sentiment(verbose=True):
     # 一次性取回近20日全部 (code, date, pctChg)，按日分组在内存里统计，
     # 避免对 dates 逐日发查询（每条 WHERE date=? 都是一次往返）。
     _all_rows = conn.execute(
-        "SELECT code, date, pctChg FROM kline_daily WHERE date>=? AND pctChg IS NOT NULL",
+        """
+        SELECT code, date, pctChg
+        FROM kline_daily
+        WHERE date>=? AND pctChg IS NOT NULL
+          AND code NOT LIKE 'sh.000%'
+          AND code NOT LIKE 'sz.399%'
+        """,
         [dates[0]]
     ).fetchall()
     _by_date = {}
@@ -470,7 +476,7 @@ def _print_report(result):
         '发酵': ('🔥', '涨停增加，板块效应显现', 'S2/S3主力，追热点板块'),
         '高潮': ('🎆', '涨停潮，百股涨停', '⚠️不追高！锁利为主，准备防守'),
         '分歧': ('⚡', '涨停衰退，昨涨停今分化', '⚠️减仓观望，只守不攻'),
-        '退潮': ('🌊', '涨停断崖，接力失败', '空仓等待冰点信号'),
+        '退潮': ('🌊', '涨停断崖，接力失败', '普通候选空仓；仅T5技术主线全条件通过者可小仓'),
         '过热': ('💥', '情绪极端，注意风险', '⛔不开新仓'),
     }
     emoji, desc, advice = phase_map.get(phase, ('❓', '未知', '观望'))

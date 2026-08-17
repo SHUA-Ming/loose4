@@ -300,6 +300,7 @@ def init_db():
             buy_date     DATE         NOT NULL,
             buy_price    DOUBLE,
             shares        INT,
+            remaining_shares INT,
             amount        DOUBLE,
             sell_date    DATE,
             sell_price   DOUBLE,
@@ -320,6 +321,24 @@ def init_db():
             invalidation_condition TEXT,
             risk_notes TEXT,
             expected_horizon VARCHAR(32),
+            hold_status VARCHAR(16) DEFAULT 'short',
+            hold_auth_date DATE,
+            hold_auth_until DATE,
+            hold_auth_score TINYINT,
+            hold_cashout_done TINYINT DEFAULT 0,
+            first_cashout_date DATE,
+            first_cashout_price DOUBLE,
+            first_cashout_shares INT,
+            realized_pnl_amount DOUBLE DEFAULT 0,
+            hold_auth_checks VARCHAR(160),
+            hold_auth_price DOUBLE,
+            hold_protect_price DOUBLE,
+            hold_next_target DOUBLE,
+            hold_reward_risk DOUBLE,
+            hold_auth_evidence TEXT,
+            hold_auth_invalidation TEXT,
+            hold_auth_count INT DEFAULT 0,
+            hold_auth_sysver VARCHAR(16),
             review_result VARCHAR(32),
             review_date DATE,
             pnl_1d DOUBLE,
@@ -372,7 +391,8 @@ def _ensure_trade_log_columns(conn):
         ('entry_low', "ALTER TABLE trade_log ADD COLUMN entry_low DOUBLE AFTER industry"),
         ('entry_high', "ALTER TABLE trade_log ADD COLUMN entry_high DOUBLE AFTER entry_low"),
         ('shares', "ALTER TABLE trade_log ADD COLUMN shares INT AFTER buy_price"),
-        ('amount', "ALTER TABLE trade_log ADD COLUMN amount DOUBLE AFTER shares"),
+        ('remaining_shares', "ALTER TABLE trade_log ADD COLUMN remaining_shares INT AFTER shares"),
+        ('amount', "ALTER TABLE trade_log ADD COLUMN amount DOUBLE AFTER remaining_shares"),
         ('sell_reason', "ALTER TABLE trade_log ADD COLUMN sell_reason VARCHAR(64) AFTER sell_price"),
         ('pnl_amount', "ALTER TABLE trade_log ADD COLUMN pnl_amount DOUBLE AFTER pnl_pct"),
         ('soft_stop', "ALTER TABLE trade_log ADD COLUMN soft_stop DOUBLE AFTER stop_price"),
@@ -386,7 +406,25 @@ def _ensure_trade_log_columns(conn):
         ('invalidation_condition', "ALTER TABLE trade_log ADD COLUMN invalidation_condition TEXT AFTER evidence_summary"),
         ('risk_notes', "ALTER TABLE trade_log ADD COLUMN risk_notes TEXT AFTER invalidation_condition"),
         ('expected_horizon', "ALTER TABLE trade_log ADD COLUMN expected_horizon VARCHAR(32) AFTER risk_notes"),
-        ('review_result', "ALTER TABLE trade_log ADD COLUMN review_result VARCHAR(32) AFTER expected_horizon"),
+        ('hold_status', "ALTER TABLE trade_log ADD COLUMN hold_status VARCHAR(16) DEFAULT 'short' AFTER expected_horizon"),
+        ('hold_auth_date', "ALTER TABLE trade_log ADD COLUMN hold_auth_date DATE AFTER hold_status"),
+        ('hold_auth_until', "ALTER TABLE trade_log ADD COLUMN hold_auth_until DATE AFTER hold_auth_date"),
+        ('hold_auth_score', "ALTER TABLE trade_log ADD COLUMN hold_auth_score TINYINT AFTER hold_auth_until"),
+        ('hold_cashout_done', "ALTER TABLE trade_log ADD COLUMN hold_cashout_done TINYINT DEFAULT 0 AFTER hold_auth_score"),
+        ('first_cashout_date', "ALTER TABLE trade_log ADD COLUMN first_cashout_date DATE AFTER hold_cashout_done"),
+        ('first_cashout_price', "ALTER TABLE trade_log ADD COLUMN first_cashout_price DOUBLE AFTER first_cashout_date"),
+        ('first_cashout_shares', "ALTER TABLE trade_log ADD COLUMN first_cashout_shares INT AFTER first_cashout_price"),
+        ('realized_pnl_amount', "ALTER TABLE trade_log ADD COLUMN realized_pnl_amount DOUBLE DEFAULT 0 AFTER first_cashout_shares"),
+        ('hold_auth_checks', "ALTER TABLE trade_log ADD COLUMN hold_auth_checks VARCHAR(160) AFTER realized_pnl_amount"),
+        ('hold_auth_price', "ALTER TABLE trade_log ADD COLUMN hold_auth_price DOUBLE AFTER hold_auth_checks"),
+        ('hold_protect_price', "ALTER TABLE trade_log ADD COLUMN hold_protect_price DOUBLE AFTER hold_auth_price"),
+        ('hold_next_target', "ALTER TABLE trade_log ADD COLUMN hold_next_target DOUBLE AFTER hold_protect_price"),
+        ('hold_reward_risk', "ALTER TABLE trade_log ADD COLUMN hold_reward_risk DOUBLE AFTER hold_next_target"),
+        ('hold_auth_evidence', "ALTER TABLE trade_log ADD COLUMN hold_auth_evidence TEXT AFTER hold_reward_risk"),
+        ('hold_auth_invalidation', "ALTER TABLE trade_log ADD COLUMN hold_auth_invalidation TEXT AFTER hold_auth_evidence"),
+        ('hold_auth_count', "ALTER TABLE trade_log ADD COLUMN hold_auth_count INT DEFAULT 0 AFTER hold_auth_invalidation"),
+        ('hold_auth_sysver', "ALTER TABLE trade_log ADD COLUMN hold_auth_sysver VARCHAR(16) AFTER hold_auth_count"),
+        ('review_result', "ALTER TABLE trade_log ADD COLUMN review_result VARCHAR(32) AFTER hold_auth_sysver"),
         ('review_date', "ALTER TABLE trade_log ADD COLUMN review_date DATE AFTER review_result"),
         ('pnl_1d', "ALTER TABLE trade_log ADD COLUMN pnl_1d DOUBLE AFTER review_date"),
         ('pnl_3d', "ALTER TABLE trade_log ADD COLUMN pnl_3d DOUBLE AFTER pnl_1d"),
@@ -406,6 +444,8 @@ def _ensure_trade_log_columns(conn):
     try:
         conn.execute("UPDATE trade_log SET trade_date = buy_date WHERE trade_date IS NULL")
         conn.execute("UPDATE trade_log SET status = CASE WHEN sell_date IS NULL THEN 'open' ELSE 'closed' END WHERE status IS NULL")
+        conn.execute("UPDATE trade_log SET remaining_shares = shares WHERE remaining_shares IS NULL AND shares IS NOT NULL AND sell_date IS NULL")
+        conn.execute("UPDATE trade_log SET remaining_shares = 0 WHERE remaining_shares IS NULL AND sell_date IS NOT NULL")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -639,15 +679,22 @@ def add_trade(code, name, buy_date, buy_price, mode='A', grade='A', score=0,
         INSERT INTO trade_log (
             code, name, trade_date, action, status, strategy, mode, grade, score,
             concept_stage, concept_name, industry, entry_low, entry_high,
-            buy_date, buy_price, shares, amount, stop_price, soft_stop,
+            buy_date, buy_price, shares, remaining_shares, amount, stop_price, soft_stop,
             target_price, target2_price, position, plan_source, buy_status,
             emotion_phase, market_mode, confidence_level, evidence_summary,
             invalidation_condition, risk_notes, expected_horizon, follow_rule, remark, sysver
-        ) VALUES (%s, %s, %s, 'buy', 'open', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s, %s)
+        ) VALUES (
+            %s, %s, %s, 'buy', 'open', %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s,
+            NULL, %s, %s
+        )
     """, (
         code, name, buy_date, strategy, mode, grade, score,
         concept_stage, concept_name, industry, entry_low, entry_high,
-        buy_date, buy_price, shares, amount, stop_price, soft_stop,
+        buy_date, buy_price, shares, shares, amount, stop_price, soft_stop,
         target_price, target2_price, position, plan_source, buy_status,
         emotion_phase, market_mode, confidence_level, evidence_summary,
         invalidation_condition, risk_notes, expected_horizon, remark, sysver,
@@ -659,29 +706,48 @@ def add_trade(code, name, buy_date, buy_price, mode='A', grade='A', score=0,
     return trade_id
 
 
+def calculate_trade_pnl(buy_price, original_shares, remaining_shares, realized_pnl, sell_price):
+    """合并部分兑现与最终卖出，返回整笔(pnl_pct, pnl_amount)。"""
+    if not buy_price:
+        return None, None
+    if original_shares:
+        remaining = remaining_shares if remaining_shares is not None else original_shares
+        final_pnl = (sell_price - buy_price) * remaining if remaining else 0
+        pnl_amount = round((realized_pnl or 0) + final_pnl, 2)
+        pnl_pct = round(pnl_amount / (buy_price * original_shares) * 100, 2)
+        return pnl_pct, pnl_amount
+    return round((sell_price - buy_price) / buy_price * 100, 2), None
+
+
 def close_trade(trade_id, sell_date, sell_price, follow_rule=1, remark=None, sell_reason=None):
     """平仓：填入卖出信息并自动计算盈亏"""
     init_db()
     conn = get_connection()
-    cur = conn.execute("SELECT buy_price, shares FROM trade_log WHERE id = %s", (trade_id,))
+    cur = conn.execute(
+        "SELECT buy_price, shares, COALESCE(remaining_shares, shares), COALESCE(realized_pnl_amount,0) "
+        "FROM trade_log WHERE id = %s",
+        (trade_id,),
+    )
     row = cur.fetchone()
     if not row:
         conn.close()
         return False
-    buy_price, shares = row[0], row[1]
-    pnl_pct = round((sell_price - buy_price) / buy_price * 100, 2) if buy_price else None
-    pnl_amount = round((sell_price - buy_price) * shares, 2) if buy_price and shares else None
+    buy_price, shares, remaining_shares, realized_pnl = row[0], row[1], row[2], row[3] or 0
+    pnl_pct, pnl_amount = calculate_trade_pnl(
+        buy_price, shares, remaining_shares, realized_pnl, sell_price
+    )
     if remark:
         conn.execute("""
             UPDATE trade_log SET trade_date=%s, action='sell', status='closed', sell_date=%s,
                 sell_price=%s, sell_reason=%s, pnl_pct=%s, pnl_amount=%s,
-                follow_rule=%s, remark=CONCAT(IFNULL(remark,''), '; ', %s) WHERE id=%s
+                remaining_shares=0, follow_rule=%s,
+                remark=CONCAT(IFNULL(remark,''), '; ', %s) WHERE id=%s
         """, (sell_date, sell_date, sell_price, sell_reason, pnl_pct, pnl_amount, follow_rule, remark, trade_id))
     else:
         conn.execute("""
             UPDATE trade_log SET trade_date=%s, action='sell', status='closed', sell_date=%s,
                 sell_price=%s, sell_reason=%s, pnl_pct=%s, pnl_amount=%s,
-                follow_rule=%s WHERE id=%s
+                remaining_shares=0, follow_rule=%s WHERE id=%s
         """, (sell_date, sell_date, sell_price, sell_reason, pnl_pct, pnl_amount, follow_rule, trade_id))
     conn.commit()
     conn.close()

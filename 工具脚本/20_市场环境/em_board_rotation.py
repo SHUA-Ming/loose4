@@ -44,12 +44,27 @@ STAGE_FRESH = "\u65b0\u664b\u6d3b\u8dc3"
 STAGE_FADE = "\u9000\u6f6e"
 STAGE_NORMAL = "\u666e\u901a\u8f6e\u52a8"
 
+PV_SHADOW_VERSION = "PV_SHADOW_V1"
+PV_SHADOW_ACTIVATION = False  # 98日近似walk-forward未证明隔日增益，禁止进入正式排序/仓位
+PV_MARKET_CODES = ("sh.000001", "sz.399001", "sz.399006")
+PV_HISTORY_CALENDAR_DAYS = 120
+PV_MIN_ACTIVE_MEMBERS = 5
+
 
 def _compound(pcts):
     value = 1.0
     for pct in pcts:
         value *= 1 + (pct or 0) / 100
     return (value - 1) * 100
+
+
+def _display_stage(stage):
+    """Keep user-facing terminology inside the current six-stage vocabulary."""
+    return STAGE_ACCEL if stage == STAGE_FRESH else stage
+
+
+def _display_rotation_text(text):
+    return str(text or "").replace(STAGE_FRESH, STAGE_ACCEL)
 
 
 def _load_info(conn):
@@ -96,6 +111,355 @@ def _load_daily(conn, codes, start_date, end_date=None):
     for col in ("close", "amount", "pctChg"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def _load_pv_board_daily(conn, codes, as_of, calendar_days=PV_HISTORY_CALENDAR_DAYS):
+    """Load the independent price-volume window without touching formal metrics."""
+    if not codes:
+        return pd.DataFrame()
+    anchor = datetime.strptime(str(as_of), "%Y-%m-%d")
+    start_date = (anchor - timedelta(days=calendar_days)).strftime("%Y-%m-%d")
+    frames = []
+    for i in range(0, len(codes), 300):
+        part = codes[i:i + 300]
+        ph = ",".join(["?"] * len(part))
+        df = pd.read_sql_query(
+            f"SELECT board_code AS code,date,open,high,low,close,amount,pctChg,updated_at "
+            f"FROM em_board_daily WHERE board_code IN ({ph}) "
+            f"AND date >= ? AND date <= ?",
+            conn,
+            params=part + [start_date, as_of],
+        )
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    df["date"] = df["date"].astype(str)
+    for col in ("open", "high", "low", "close", "amount", "pctChg"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _load_pv_members_today(conn, as_of):
+    """Load all L3 constituents for one date in one bulk query (no industry N+1)."""
+    df = pd.read_sql_query(
+        """
+        SELECT l3.board_code AS code, s.code AS stock_code,
+               k.close, k.amount, k.pctChg
+        FROM em_stock_board_l3 s
+        JOIN em_board_l3 l3 ON s.l3_id = l3.id
+        JOIN kline_daily k FORCE INDEX (PRIMARY)
+          ON k.code = s.code AND k.date = ?
+        """,
+        conn,
+        params=[as_of],
+    )
+    if df.empty:
+        return df
+    for col in ("close", "amount", "pctChg"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def _load_pv_market_today(conn, as_of):
+    """Return the equal-weight return of three broad indices only when all are present."""
+    ph = ",".join(["?"] * len(PV_MARKET_CODES))
+    rows = conn.execute(
+        f"SELECT code,pctChg FROM kline_daily WHERE code IN ({ph}) AND date = ?",
+        list(PV_MARKET_CODES) + [as_of],
+    ).fetchall()
+    values = {
+        str(code): float(pct)
+        for code, pct in rows
+        if pct is not None and np.isfinite(float(pct))
+    }
+    if any(code not in values for code in PV_MARKET_CODES):
+        return None, len(values)
+    return float(np.mean([values[code] for code in PV_MARKET_CODES])), len(values)
+
+
+def _pv_band_score(value, bands):
+    """Score an ordered list of ``(lower_bound, score)`` from high to low."""
+    for lower_bound, score in bands:
+        if value >= lower_bound:
+            return score
+    return bands[-1][1]
+
+
+def _build_pv_features(board_df, member_df, market_pct, as_of):
+    """Build six close-only shadow features; every baseline excludes the target day."""
+    expected_last3 = sorted(
+        date for date in board_df["date"].astype(str).unique() if date <= str(as_of)
+    )[-3:]
+    member_stats = {}
+    if member_df is not None and not member_df.empty:
+        active = member_df[
+            member_df["close"].gt(0)
+            & member_df["amount"].gt(0)
+            & member_df["pctChg"].notna()
+        ].copy()
+        active["positive_contribution"] = active["pctChg"].clip(lower=0) * active["amount"]
+        for code, grp in active.groupby("code"):
+            active_count = int(len(grp))
+            up_count = int(grp["pctChg"].gt(0).sum())
+            positive = grp[grp["positive_contribution"].gt(0)]["positive_contribution"]
+            positive_count = int(len(positive))
+            concentration = None
+            if positive_count >= 3 and float(positive.sum()) > 0:
+                concentration = float(positive.nlargest(3).sum() / positive.sum())
+            member_stats[str(code)] = {
+                "active_count": active_count,
+                "up_count": up_count,
+                "breadth": float(up_count / active_count) if active_count else None,
+                "positive_count": positive_count,
+                "top3_concentration": concentration,
+            }
+
+    features = {}
+    today_iso = datetime.now().strftime("%Y-%m-%d")
+    for code, raw_grp in board_df.groupby("code"):
+        grp = raw_grp.sort_values("date").copy()
+        grp["prior20_amount"] = grp["amount"].shift(1).rolling(20, min_periods=20).mean()
+        grp["day_amount_ratio20"] = grp["amount"] / grp["prior20_amount"]
+        today_rows = grp[grp["date"].eq(str(as_of))]
+        if today_rows.empty:
+            continue
+        today = today_rows.iloc[-1]
+        today_pct = float(today["pctChg"]) if pd.notna(today["pctChg"]) else None
+        notes = []
+        component_scores = {}
+
+        amount_ratio20 = None
+        if pd.notna(today["day_amount_ratio20"]) and np.isfinite(float(today["day_amount_ratio20"])):
+            amount_ratio20 = float(today["day_amount_ratio20"])
+            if today_pct is None:
+                notes.append("行业涨幅缺失")
+            elif today_pct > 0:
+                component_scores["price_volume"] = _pv_band_score(
+                    amount_ratio20, ((1.50, 2), (1.20, 1), (0.80, 0), (-np.inf, -1))
+                )
+            elif today_pct < 0 and amount_ratio20 >= 1.20:
+                component_scores["price_volume"] = -1
+                notes.append("放量下跌")
+            else:
+                component_scores["price_volume"] = 0
+        else:
+            notes.append("20日量能基线不足")
+
+        close_pos = None
+        if pd.notna(today["high"]) and pd.notna(today["low"]) and pd.notna(today["close"]):
+            day_range = float(today["high"] - today["low"])
+            if day_range > 0:
+                close_pos = float(np.clip((today["close"] - today["low"]) / day_range, 0, 1))
+                component_scores["close_position"] = _pv_band_score(
+                    close_pos, ((0.75, 2), (0.60, 1), (0.35, 0), (-np.inf, -1))
+                )
+            elif day_range == 0:
+                close_pos = 0.5
+                component_scores["close_position"] = 0
+                notes.append("平K线")
+            else:
+                notes.append("日K高低价异常")
+        else:
+            notes.append("日K价格缺失")
+
+        excess_pct = None
+        if today_pct is not None and market_pct is not None:
+            excess_pct = today_pct - market_pct
+            component_scores["relative_strength"] = _pv_band_score(
+                excess_pct, ((2.0, 2), (0.5, 1), (-0.5, 0), (-np.inf, -1))
+            )
+        else:
+            notes.append("三指数同日基准不足" if market_pct is None else "行业涨幅缺失")
+
+        members = member_stats.get(str(code))
+        breadth = None
+        active_count = 0
+        up_count = 0
+        positive_count = 0
+        top3_concentration = None
+        if members:
+            active_count = members["active_count"]
+            up_count = members["up_count"]
+            positive_count = members["positive_count"]
+            breadth = members["breadth"]
+            top3_concentration = members["top3_concentration"]
+            if active_count < PV_MIN_ACTIVE_MEMBERS:
+                component_scores["breadth"] = 0
+                component_scores["concentration"] = 0
+                notes.append("成分不足5只，宽度/集中度按中性")
+            else:
+                if breadth >= 0.65 and up_count >= 3:
+                    component_scores["breadth"] = 2
+                elif breadth >= 0.55:
+                    component_scores["breadth"] = 1
+                elif breadth < 0.35:
+                    component_scores["breadth"] = -1
+                else:
+                    component_scores["breadth"] = 0
+
+                if top3_concentration is None:
+                    component_scores["concentration"] = -1
+                    notes.append("上涨贡献不足3只")
+                else:
+                    component_scores["concentration"] = _pv_band_score(
+                        -top3_concentration,
+                        ((-0.50, 2), (-0.70, 1), (-0.85, 0), (-np.inf, -1)),
+                    )
+        else:
+            notes.append("当日成分行情缺失")
+
+        last3 = grp[grp["date"].le(str(as_of))].tail(3)
+        confirm_days = None
+        confirm_streak = None
+        cum3 = None
+        if (
+            len(last3) == 3
+            and last3["date"].astype(str).tolist() == expected_last3
+            and str(last3.iloc[-1]["date"]) == str(as_of)
+            and last3["pctChg"].notna().all()
+            and last3["day_amount_ratio20"].notna().all()
+        ):
+            confirm_flags = (
+                last3["pctChg"].gt(0) & last3["day_amount_ratio20"].ge(0.90)
+            ).tolist()
+            confirm_days = int(sum(confirm_flags))
+            confirm_streak = 0
+            for confirmed in reversed(confirm_flags):
+                if not confirmed:
+                    break
+                confirm_streak += 1
+            cum3 = float(_compound(last3["pctChg"].tolist()))
+            if confirm_streak == 3:
+                component_scores["continuity_3d"] = 2
+            elif confirm_streak == 2:
+                component_scores["continuity_3d"] = 1
+            elif (
+                float(last3.iloc[-1]["pctChg"]) < 0
+                and (
+                    float(last3.iloc[-1]["day_amount_ratio20"]) >= 1.20
+                    or cum3 < 0
+                )
+            ):
+                component_scores["continuity_3d"] = -1
+            else:
+                component_scores["continuity_3d"] = 0
+        else:
+            notes.append("3日量价基线不足")
+
+        intraday_snapshot = False
+        if str(as_of) == today_iso and pd.notna(today.get("updated_at")):
+            updated_at = pd.to_datetime(today["updated_at"], errors="coerce")
+            if pd.notna(updated_at) and updated_at.strftime("%Y-%m-%d") == str(as_of):
+                intraday_snapshot = (updated_at.hour, updated_at.minute) < (15, 0)
+        if intraday_snapshot:
+            notes.append("当日快照早于15:00")
+
+        complete = (
+            len(component_scores) == 6
+            and active_count > 0
+            and not intraday_snapshot
+        )
+        pv_score = int(sum(component_scores.values())) if complete else None
+        signals = []
+        if complete:
+            if (
+                today_pct > 0
+                and amount_ratio20 >= 1.20
+                and breadth is not None and breadth >= 0.55
+                and close_pos is not None and close_pos >= 0.60
+            ):
+                signals.append("量价共振")
+            if today_pct < 0 and amount_ratio20 >= 1.20:
+                signals.append("放量下跌")
+            elif today_pct > 0 and amount_ratio20 < 0.80:
+                signals.append("缩量上涨")
+            if breadth is not None and active_count >= PV_MIN_ACTIVE_MEMBERS:
+                if breadth >= 0.65:
+                    signals.append("宽度扩散")
+                elif breadth < 0.35:
+                    signals.append("宽度不足")
+            if close_pos is not None and close_pos < 0.35:
+                signals.append("收位偏弱")
+            if top3_concentration is not None and top3_concentration > 0.85:
+                signals.append("单点驱动")
+            if confirm_streak is not None and confirm_streak >= 2:
+                signals.append("连续确认")
+            if excess_pct is not None:
+                if excess_pct >= 0.50:
+                    signals.append("相对强")
+                elif excess_pct < -0.50:
+                    signals.append("相对弱")
+        features[str(code)] = {
+            "version": PV_SHADOW_VERSION,
+            "as_of": str(as_of),
+            "complete": complete,
+            "confidence": "normal" if active_count >= PV_MIN_ACTIVE_MEMBERS else "low",
+            "today_pct": round(today_pct, 4) if today_pct is not None else None,
+            "amount_ratio20": round(amount_ratio20, 4) if amount_ratio20 is not None else None,
+            "breadth": round(breadth, 4) if breadth is not None else None,
+            "up_count": up_count,
+            "active_count": active_count,
+            "close_position": round(close_pos, 4) if close_pos is not None else None,
+            "market_pct": round(market_pct, 4) if market_pct is not None else None,
+            "excess_pct": round(excess_pct, 4) if excess_pct is not None else None,
+            "top3_concentration": (
+                round(top3_concentration, 4) if top3_concentration is not None else None
+            ),
+            "positive_count": positive_count,
+            "confirm_days_3d": confirm_days,
+            "confirm_streak_3d": confirm_streak,
+            "cum3": round(cum3, 4) if cum3 is not None else None,
+            "component_scores": component_scores,
+            "score": pv_score,
+            "signals": signals,
+            "notes": notes,
+        }
+    return features
+
+
+def _attach_pv_shadow(metrics, features):
+    """Build copied shadow records; never mutate or reorder formal metric objects."""
+    eligible = []
+    shadow_all = []
+    eligible_formal_rank = 0
+    for formal_rank, item in enumerate(metrics, 1):
+        shadow = dict(features.get(str(item["code"]), {
+            "version": PV_SHADOW_VERSION,
+            "as_of": item.get("win_end"),
+            "complete": False,
+            "confidence": "missing",
+            "score": None,
+            "notes": ["量价数据缺失"],
+        }))
+        shadow["formal_rank"] = formal_rank
+        record = dict(item)
+        record["shadow"] = shadow
+        if shadow.get("complete") and shadow.get("score") is not None:
+            eligible_formal_rank += 1
+            shadow["enhanced_score"] = round(float(item["score"]) + float(shadow["score"]), 1)
+            shadow["eligible_formal_rank"] = eligible_formal_rank
+            eligible.append(record)
+        else:
+            shadow["enhanced_score"] = None
+            shadow["eligible_formal_rank"] = None
+        shadow["enhanced_rank"] = None
+        shadow["rank_delta"] = None
+        shadow_all.append(record)
+
+    eligible.sort(
+        key=lambda item: (
+            -item["shadow"]["enhanced_score"],
+            -item["score"],
+            str(item["code"]),
+        )
+    )
+    for enhanced_rank, item in enumerate(eligible, 1):
+        shadow = item["shadow"]
+        shadow["enhanced_rank"] = enhanced_rank
+        shadow["rank_delta"] = shadow["eligible_formal_rank"] - enhanced_rank
+    return eligible, shadow_all
 
 
 def _build_metrics(df, window, info):
@@ -314,8 +678,14 @@ def _load_leaders(conn, l3_code, win_start, win_end, today, top_n=5):
     return out[:top_n]
 
 
-def _load_l1_context(conn, l1_codes, info, window):
-    df = _load_daily(conn, l1_codes, (datetime.now() - timedelta(days=40)).strftime("%Y-%m-%d"))
+def _load_l1_context(conn, l1_codes, info, window, as_of=None):
+    anchor = datetime.strptime(str(as_of), "%Y-%m-%d") if as_of else datetime.now()
+    df = _load_daily(
+        conn,
+        l1_codes,
+        (anchor - timedelta(days=40)).strftime("%Y-%m-%d"),
+        end_date=as_of,
+    )
     if df.empty:
         return []
     dates = sorted(df["date"].unique())
@@ -333,25 +703,55 @@ def _load_l1_context(conn, l1_codes, info, window):
     return out
 
 
-def analyze(window=10, lookback=45, as_of=None, with_leaders=False, leader_top=5):
+def analyze(
+    window=10,
+    lookback=45,
+    as_of=None,
+    with_leaders=False,
+    leader_top=5,
+    with_pv_shadow=False,
+):
+    """Analyze formal rotation and optionally attach an isolated price-volume shadow."""
     conn = get_connection(readonly=True)
     info, l3_codes, l1_codes = _load_info(conn)
     if not l3_codes:
         conn.close()
         return {"error": "em_board_l3 为空，请先运行 _fetch_em_board_hierarchy.py"}
 
-    start_date = (datetime.now() - timedelta(days=lookback)).strftime("%Y-%m-%d")
+    anchor = datetime.strptime(str(as_of), "%Y-%m-%d") if as_of else datetime.now()
+    start_date = (anchor - timedelta(days=lookback)).strftime("%Y-%m-%d")
     df = _load_daily(conn, l3_codes, start_date, end_date=as_of)
     if df.empty:
         conn.close()
         return {"error": "em_board_daily 为空，请先运行 _fetch_em_board_daily.py --days 60"}
 
     metrics, win = _build_metrics(df, window, info)
-    l1_ctx = _load_l1_context(conn, l1_codes, info, window)
+    l1_ctx = _load_l1_context(conn, l1_codes, info, window, as_of=win[-1])
     tomorrow_priority, tomorrow_downgrade, tomorrow_ban = _build_tomorrow_buckets(metrics)
 
+    pv_shadow = []
+    pv_shadow_all = []
+    pv_error = None
+    pv_market_pct = None
+    pv_market_count = 0
+    if with_pv_shadow and metrics:
+        try:
+            pv_as_of = win[-1]
+            pv_board = _load_pv_board_daily(conn, l3_codes, pv_as_of)
+            pv_members = _load_pv_members_today(conn, pv_as_of)
+            pv_market_pct, pv_market_count = _load_pv_market_today(conn, pv_as_of)
+            pv_features = _build_pv_features(
+                pv_board,
+                pv_members,
+                pv_market_pct,
+                pv_as_of,
+            )
+            pv_shadow, pv_shadow_all = _attach_pv_shadow(metrics, pv_features)
+        except Exception as exc:
+            pv_error = f"{type(exc).__name__}: {exc}"
+
     if with_leaders and metrics:
-        today = _latest_kline_date(conn) or win[-1]
+        today = win[-1] if as_of else (_latest_kline_date(conn) or win[-1])
         for m in metrics:
             if m["stage"] in STRONG_STAGES:
                 m["leaders"] = _load_leaders(conn, m["code"], win[0], win[-1], today, top_n=leader_top)
@@ -362,7 +762,7 @@ def analyze(window=10, lookback=45, as_of=None, with_leaders=False, leader_top=5
 
     if not metrics:
         return {"error": "东方财富三级行业日K不足，至少需要4个交易日"}
-    return {
+    result = {
         "win_start": win[0],
         "win_end": win[-1],
         "window": len(win),
@@ -381,6 +781,20 @@ def analyze(window=10, lookback=45, as_of=None, with_leaders=False, leader_top=5
         "fresh": [m for m in metrics if m["stage"] == "新晋活跃"],
         "fade": sorted([m for m in metrics if m["stage"] == "退潮"], key=lambda x: x["cumB"]),
     }
+    if with_pv_shadow:
+        result.update({
+            "pv_shadow_version": PV_SHADOW_VERSION,
+            "pv_shadow_activation": PV_SHADOW_ACTIVATION,
+            "pv_shadow_status": "shadow_only_no_stable_incremental_alpha",
+            "pv_as_of": win[-1],
+            "pv_market_pct": pv_market_pct,
+            "pv_market_count": pv_market_count,
+            "pv_complete_count": len(pv_shadow),
+            "pv_shadow_top": pv_shadow,
+            "pv_shadow_all": pv_shadow_all,
+            "pv_error": pv_error,
+        })
+    return result
 
 
 def _print_section(title, items, n):
@@ -398,7 +812,7 @@ def _print_section(title, items, n):
         print(f"  {i:>2d} {m['name'][:11]:<12s}{str(m['l1'])[:7]:<8s}{str(m['l2'])[:9]:<10s}"
               f"{m['cum10']:>6.1f}%{m['cumA']:>6.1f}%{m['cumB']:>6.1f}%"
               f"{m['top20_full']:>4d}/{m['window']:<2d}"
-              f"{m['top20_A']:>3d}/{m['top20_B']:<2d}{m['amt_ratio']:>5.2f}x {m['stage']:<6s}")
+              f"{m['top20_A']:>3d}/{m['top20_B']:<2d}{m['amt_ratio']:>5.2f}x {_display_stage(m['stage']):<6s}")
 
 
 def _print_tomorrow_plan(result, n):
@@ -419,11 +833,11 @@ def _print_tomorrow_plan(result, n):
         for i, m in enumerate(items[:limit], 1):
             print(
                 f"    {i:>2d}. {m['name'][:12]:<13s}"
-                f"[{m.get('stage', '-'):<6s}] "
+                f"[{_display_stage(m.get('stage', '-')):<6s}] "
                 f"\u4e24\u5468{m['cum10']:+5.1f}% B\u5468{m['cumB']:+5.1f}% "
                 f"\u524d20%={m['top20_full']}/{m['window']} "
                 f"\u91cf\u80fd{m['amt_ratio']:.2f}x  "
-                f"{m.get('tomorrow_reason', '')}"
+                f"{_display_rotation_text(m.get('tomorrow_reason', ''))}"
             )
     print("=" * 92)
 
@@ -445,7 +859,7 @@ def _print_leaders(strong, today, win_start, win_end, n_industries=12, per=5):
             mark = "★" if item["mb"] else "○"
             today_txt = f"{item['today']:+.0f}%" if item["today"] == item["today"] else "-"
             cells.append(f"{mark}{item['name'][:5]}(两周{item['chg2w']:+.0f}% 今{today_txt})")
-        print(f"  【{m['name'][:10]}·{m['stage']}】{tag}")
+        print(f"  【{m['name'][:10]}·{_display_stage(m['stage'])}】{tag}")
         print("      " + "  ".join(cells))
         shown += 1
         if shown >= n_industries:
@@ -455,6 +869,59 @@ def _print_leaders(strong, today, win_start, win_end, n_industries=12, per=5):
     print("=" * 92)
 
 
+def _print_pv_shadow(result, n):
+    """Append the price-volume shadow table without altering any formal section."""
+    line_width = 142
+    print()
+    print("=" * line_width)
+    print("  量价状态影子榜（历史暂未证明隔日增益；不改变正式行业档位、明日预案、排序或仓位）")
+    print("-" * line_width)
+    if result.get("pv_error"):
+        print(f"  影子层计算失败，正式结果不受影响：{result['pv_error']}")
+        print("=" * line_width)
+        return
+    items = result.get("pv_shadow_top") or []
+    market = result.get("pv_market_pct")
+    market_text = f"{market:+.2f}%" if market is not None else "缺失"
+    print(
+        f"  日期: {result.get('pv_as_of', '-')}  三指数等权: {market_text}  "
+        f"完整覆盖: {result.get('pv_complete_count', 0)}/{result.get('l3_count', 0)}"
+    )
+    if not items:
+        print("  （暂无完整量价样本）")
+        print("=" * line_width)
+        return
+    print(
+        f"  {'影排':>4s} {'原排':>4s} {'三级行业':<13s} {'置信':>4s} {'PV':>3s} {'原分':>6s} {'增强':>6s} "
+        f"{'今涨':>7s} {'量/20日':>8s} {'上涨宽度':>10s} {'收位':>7s} {'超大盘':>8s} {'前三集中':>9s} {'3日确认':>8s} {'状态':<18s}"
+    )
+    print("-" * line_width)
+    for item in items[:n]:
+        shadow = item["shadow"]
+        breadth = shadow.get("breadth")
+        close_pos = shadow.get("close_position")
+        concentration = shadow.get("top3_concentration")
+        concentration_text = f"{concentration * 100:>8.0f}%" if concentration is not None else f"{'--':>9s}"
+        confidence_text = "正常" if shadow.get("confidence") == "normal" else "低"
+        signals_text = "、".join(shadow.get("signals") or []) or "-"
+        print(
+            f"  {shadow['enhanced_rank']:>4d} {shadow['formal_rank']:>4d} "
+            f"{item['name'][:12]:<13s} {confidence_text:>4s} {shadow['score']:>+3d} "
+            f"{item['score']:>6.1f} {shadow['enhanced_score']:>6.1f} "
+            f"{shadow['today_pct']:>+6.2f}% {shadow['amount_ratio20']:>7.2f}x "
+            f"{shadow['up_count']:>3d}/{shadow['active_count']:<3d}"
+            f"({breadth * 100:>4.0f}%) {close_pos * 100:>6.0f}% "
+            f"{shadow['excess_pct']:>+7.2f}% "
+            f"{concentration_text} {shadow['confirm_streak_3d']:>5d}/3 {signals_text[:18]:<18s}"
+        )
+    print("-" * line_width)
+    print("  PV=-6~+12：当日量价、上涨宽度、收盘位置、相对大盘、前三贡献集中度、3日连续确认各-1~+2。")
+    print("  置信=低：有效成分不足5只，宽度与集中度按中性计分，不因小样本获得奖惩。")
+    print("  前三集中度为 max(个股涨幅,0)×个股成交额的代理值；当前成分映射用于历史检验时存在成分幸存偏差。")
+    print("  98日近似walk-forward未发现稳定增量收益，当前只作量价状态/过热风险解释，禁止据此加仓。")
+    print("=" * line_width)
+
+
 def main():
     parser = argparse.ArgumentParser(description="东方财富三级行业两周轮动分析")
     parser.add_argument("--window", type=int, default=10, help="轮动窗口交易日数，默认10")
@@ -462,6 +929,11 @@ def main():
     parser.add_argument("--top", type=int, default=18, help="各榜单最多输出多少个")
     parser.add_argument("--as-of", default=None, help="只分析到指定日期 YYYY-MM-DD")
     parser.add_argument("--no-leaders", action="store_true", help="不展示主板龙头")
+    parser.add_argument(
+        "--no-pv-shadow",
+        action="store_true",
+        help="关闭量价增强影子榜（API导入默认关闭，命令行默认展示）",
+    )
     args = parser.parse_args()
 
     result = analyze(
@@ -469,6 +941,7 @@ def main():
         lookback=args.lookback,
         as_of=args.as_of,
         with_leaders=not args.no_leaders,
+        with_pv_shadow=not args.no_pv_shadow,
     )
     if "error" in result:
         print(result["error"])
@@ -497,7 +970,7 @@ def main():
     print("-" * 92)
     strong = [m for m in result["top"] if m["stage"] in STRONG_STAGES]
     for i, m in enumerate(strong[:20], 1):
-        print(f"  {i:>2d}. {m['name'][:12]:<13s}[{m['stage']:<6s}] "
+        print(f"  {i:>2d}. {m['name'][:12]:<13s}[{_display_stage(m['stage']):<6s}] "
               f"一级:{str(m['l1'])[:6]:<7s} 二级:{str(m['l2'])[:8]:<9s} "
               f"两周{m['cum10']:+5.1f}% B周{m['cumB']:+5.1f}% "
               f"前20%={m['top20_full']}/{m['window']}天 量能{m['amt_ratio']:.2f}x")
@@ -508,6 +981,8 @@ def main():
 
     print("  用法: 先看①②定主线和接力方向，再回到候选股表看同三级行业内的主板前排。")
     print("=" * 92)
+    if not args.no_pv_shadow:
+        _print_pv_shadow(result, min(args.top, 20))
     return 0
 
 

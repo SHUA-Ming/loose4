@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""离线选股器 V10主线趋势版 - 市场模式+情绪周期+梯队定位
+"""离线选股器 V11板块优先版 - 市场模式控仓+行业主攻+梯队定位
 
 根据 market_mode.py 判定的市场模式(M1-M5)：
     - 自动启用/禁用/试探策略
@@ -8,6 +8,7 @@
   - 动态调整S3 X2放宽阈值
 当前能力：
   - 情绪周期仓位修正(position_modifier)
+  - M5/退潮继续扫描，技术焦点强板块A级前排可走1/12狙击例外
   - 板块轮动加成/惩罚
   - 梯队定位(龙头/跟风/补涨)
   - 跨策略合并排序，同行业/同板块不去重
@@ -39,6 +40,27 @@ from chip_cost import analyze_chip_cost, chip_entry_check
 # V13: 个股加成统一走东方财富三级行业。
 import pandas as pd
 import numpy as np
+from sniper_execution import apply_tail_confirmation, continuation_score, select_execution_targets
+
+
+def _load_tech_focus_config():
+    """加载技术主线焦点池与M5例外阈值；失败时返回关闭例外的安全配置。"""
+    path = Path(__file__).parent / "tech_focus.json"
+    try:
+        config = json.loads(path.read_text("utf-8"))
+        return config, ""
+    except Exception as exc:
+        return {
+            "version": 0,
+            "name": "技术主线狙击池",
+            "l2": [],
+            "l3": [],
+            "m5_exception": {},
+        }, str(exc)
+
+
+TECH_FOCUS_CONFIG, _tech_focus_error = _load_tech_focus_config()
+TECH_FOCUS_RULE = TECH_FOCUS_CONFIG.get("m5_exception", {})
 
 
 def _limit_up_threshold(code):
@@ -52,11 +74,18 @@ def _limit_up_threshold(code):
 # ═══ V6: 先判定市场模式 ═══
 mode_key, mode_cfg, mode_details = detect_market_mode(verbose=True)
 MODE = get_mode_params()
-print(f"\n  >>> offline_screener V10主线趋势版 已加载模式: {MODE['mode']} | 综合情绪: {MODE['composite_emotion']}/10")
+print(f"\n  >>> offline_screener V11板块优先版 已加载模式: {MODE['mode']} | 综合情绪: {MODE['composite_emotion']}/10")
 print(f"  >>> 策略: S1={MODE['strategies']['S1']} S2={MODE['strategies']['S2']} S3={MODE['strategies']['S3']} S4={MODE['strategies'].get('S4', 'disabled')}")
 print(f"  >>> 情绪周期: {MODE['cycle_phase']}(得分{MODE['cycle_score']}/12)  仓位修正: {MODE['position_modifier']}")
 if MODE['cycle_warning']:
     print(f"  >>> ⚠️ {MODE['cycle_warning']}")
+if _tech_focus_error:
+    print(f"  >>> ⚠️ 技术焦点配置加载失败，M5例外自动关闭: {_tech_focus_error}")
+else:
+    print(
+        f"  >>> 技术焦点池 v{TECH_FOCUS_CONFIG.get('version', '?')}: "
+        f"二级{len(TECH_FOCUS_CONFIG.get('l2', []))}类 + 三级{len(TECH_FOCUS_CONFIG.get('l3', []))}类"
+    )
 # 板块轮动提示
 rot = MODE.get('sector_rotation', {})
 if rot.get('rising'):
@@ -108,10 +137,14 @@ def _load_chip(code, price):
 
 
 def _mode_tp_tiers(mode, strategy):
-    """返回策略止盈档位：S4给主线趋势更多空间，其余沿用V8统一止盈。"""
+    """返回 (首次兑现, 强势目标, 移动回撤)。
+
+    v7 将 D1 首次兑现与强势目标拆开：先吃 2%~2.5% 的高频冲高，
+    +4% / S4 +6% 保留为第二目标，不再让第一笔兑现死等低频大涨幅。
+    """
     if strategy == 'S4':
-        return 0.06, 0.03
-    return 0.04, 0.025
+        return 0.025, 0.06, 0.03
+    return 0.0225, 0.04, 0.025
 
 
 def _role_enabled(role):
@@ -131,6 +164,16 @@ def _downgrade_position_fraction(pos_text):
 
 
 def _position_for_candidate(candidate, pos_mod=1.0):
+    if MODE.get('mode') == 'M5':
+        if candidate.get('_m5_exception_eligible'):
+            if candidate.get('tomorrow_bucket') == TOMORROW_DOWNGRADE:
+                position = TECH_FOCUS_RULE.get('downgrade_position', '1/16')
+                note = 'M5技术主线例外，降权行业再降一档'
+            else:
+                position = TECH_FOCUS_RULE.get('priority_position', '1/12')
+                note = 'M5技术主线狙击例外'
+            return f"{position}（{note}）"
+        return '禁止开仓（M5普通候选仅观察）'
     if pos_mod == 0:
         return '禁止开仓'
     pos_cfg = MODE.get('position', {})
@@ -210,26 +253,29 @@ def _compute_plan(strategy, c, chip, mode):
             entry_lo = max(entry_lo, sz[1] * 0.99)
             entry_basis += f" 筹码{sz[1]:.2f}托底"
 
-    # ═══ 2. 止盈目标 → V8统一+4%，筹码压力只做风险提示 ═══
-    tp1_pct, trail_pct = _mode_tp_tiers(mode, strategy)
+    # ═══ 2. 止盈目标 → D1先兑现，强势仓继续看第二目标 ═══
+    tp1_pct, tp2_pct, trail_pct = _mode_tp_tiers(mode, strategy)
     fallback_tp1 = price * (1 + tp1_pct)
-    fallback_tp2 = price * (1 + tp1_pct + trail_pct)
-    tp_label = f"+{tp1_pct:.0%}"
-    tp_prefix = "S4主线趋势" if strategy == 'S4' else "V8统一"
+    fallback_tp2 = price * (1 + tp2_pct)
+    tp1_label = f"+{tp1_pct:.1%}"
+    tp2_label = f"+{tp2_pct:.0%}"
 
     if rz:
         tp1 = fallback_tp1
         tp2 = fallback_tp2
-        if rz[0] <= fallback_tp1:
-            tp1_basis = f"{tp_prefix}{tp_label}，但压力区{rz[0]:.2f}~{rz[1]:.2f}在目标内，需提前减仓"
+        if price * 1.005 < rz[0] < fallback_tp1:
+            tp1 = rz[0]
+            tp1_basis = f"最近压力{rz[0]:.2f}~{rz[1]:.2f}早于{tp1_label}，压力位先兑现"
+        elif rz[0] <= fallback_tp1:
+            tp1_basis = f"D1首次兑现{tp1_label}，压力区{rz[0]:.2f}~{rz[1]:.2f}需盯冲高"
         else:
-            tp1_basis = f"{tp_prefix}{tp_label}，上方压力{rz[0]:.2f}~{rz[1]:.2f}作参考"
-        tp2_basis = f"移动止盈：最高点回落{trail_pct:.1%}全清"
+            tp1_basis = f"D1首次兑现{tp1_label}，上方压力{rz[0]:.2f}~{rz[1]:.2f}作参考"
+        tp2_basis = f"强势目标{tp2_label}；剩余仓从高点回落{trail_pct:.1%}全清"
     else:
         tp1 = fallback_tp1
         tp2 = fallback_tp2
-        tp1_basis = tp_label
-        tp2_basis = f"移动止盈：最高点回落{trail_pct:.1%}全清"
+        tp1_basis = f"D1首次兑现{tp1_label}"
+        tp2_basis = f"强势目标{tp2_label}；剩余仓从高点回落{trail_pct:.1%}全清"
 
     # ═══ 3. 止损 → 优先用历史支撑 ═══
     soft_stop = price * 0.985  # 通用软止损: 收盘-1.5%
@@ -274,9 +320,9 @@ def _compute_plan(strategy, c, chip, mode):
         hard_stop = max(ref * 0.97, c['ma5'] * 0.985)
         soft_stop = ref * 0.985
         tp1 = ref * (1 + tp1_pct)
-        tp2 = ref * (1 + tp1_pct + trail_pct)
-        tp1_basis = f"回踩买价{ref:.2f}+{tp1_pct:.0%}(等回踩,成交后按实际买价重算)"
-        tp2_basis = f"移动止盈：最高点回落{trail_pct:.1%}全清"
+        tp2 = ref * (1 + tp2_pct)
+        tp1_basis = f"回踩买价{ref:.2f}+{tp1_pct:.1%}先兑现(成交后重算)"
+        tp2_basis = f"强势目标+{tp2_pct:.0%}；高点回落{trail_pct:.1%}全清"
         stop_basis = "MA5×0.985或回踩买价-3%(等回踩,成交后重算)"
 
     # 确保止盈>入场，止损<入场
@@ -290,22 +336,76 @@ def _compute_plan(strategy, c, chip, mode):
     }
 
 
+def _candidate_plan(candidate):
+    plan = candidate.get('_plan')
+    if plan is None:
+        chip = _load_chip(candidate['code'], candidate['price'])
+        plan = _compute_plan(candidate.get('strategy', 'S1'), candidate, chip, MODE['mode'])
+        candidate['_plan'] = plan
+    return plan
+
+
+def _tail_confirmation_for_candidate(candidate):
+    """计算尾盘三项确认：个股20日量比、K线收盘位置、同三级行业同步。"""
+    df = _get_kline(candidate['code'])
+    if df.empty:
+        return 0, {'volume_ratio': 0.0, 'close_position': 0.0, 'sector_up_count': 0, 'labels': ['个股K线缺失']}
+
+    row = df.iloc[-1]
+    close = float(candidate.get('price', row.get('close', 0)) or 0)
+    high = float(row.get('high', close) or close)
+    low = float(row.get('low', close) or close)
+    close_position = (close - low) / (high - low) if high > low else 0.5
+
+    volumes = pd.to_numeric(df['volume'], errors='coerce').dropna().values
+    prior = volumes[-21:-1] if len(volumes) >= 21 else volumes[:-1]
+    avg20 = float(np.mean(prior[-20:])) if len(prior) else 0.0
+    volume_ratio = float(volumes[-1] / avg20) if avg20 > 0 and len(volumes) else 0.0
+
+    breadth = sector_breadth.get(candidate.get('industry') or '', {})
+    sector_up_count = int(breadth.get('up_count', 0) or 0)
+    candidate_up = float(candidate.get('pct_today', 0) or 0) > 0
+
+    checks = (
+        volume_ratio > 1.20,
+        close_position >= 0.50,
+        candidate_up and sector_up_count >= 2,
+    )
+    labels = [
+        f"量能{'OK' if checks[0] else 'NO'}({volume_ratio:.2f}x)",
+        f"收盘位{'OK' if checks[1] else 'NO'}({close_position:.0%})",
+        f"板块同步{'OK' if checks[2] else 'NO'}(上涨{sector_up_count}只)",
+    ]
+    return sum(checks), {
+        'volume_ratio': volume_ratio,
+        'close_position': close_position,
+        'sector_up_count': sector_up_count,
+        'labels': labels,
+    }
+
+
 def _buy_status_for_candidate(candidate):
-    chip = _load_chip(candidate['code'], candidate['price'])
-    plan = _compute_plan(candidate.get('strategy', 'S1'), candidate, chip, MODE['mode'])
+    plan = _candidate_plan(candidate)
     price = candidate['price']
     if price > plan['entry_hi']:
         return '等回踩'
     if price < plan['entry_lo']:
         return '等确认'
-    reward = plan['tp1'] - price
+    # 买点盈亏比仍以完整仓位的强势目标计算；止盈1是D1部分兑现，不是整笔交易上限。
+    reward = plan['tp2'] - price
     risk = price - plan['hard_stop']
     rr_now = reward / risk if risk > 0 else 0
     if rr_now >= 1.25:
-        return '可买'
-    if rr_now >= 1.0:
-        return '小仓'
-    return '仅观察'
+        base_status = '可买'
+    elif rr_now >= 1.0:
+        base_status = '小仓'
+    else:
+        base_status = '仅观察'
+
+    confirm_count, confirm_detail = _tail_confirmation_for_candidate(candidate)
+    candidate['_tail_confirm_count'] = confirm_count
+    candidate['_tail_confirmation'] = confirm_detail
+    return apply_tail_confirmation(base_status, confirm_count)
 
 
 def _print_plan(plan, mode, strategy):
@@ -321,22 +421,22 @@ def _print_plan(plan, mode, strategy):
     else:
         tp_note = "卖1/2 → 全清"
 
-    plan_title = "S4主线趋势止盈" if strategy == 'S4' else "V8统一止盈"
+    plan_title = "v7狙击闭环止盈"
     print(f"  ── 操作计划 ({plan_title}) ──")
     print(f"  入场区间: {p['entry_lo']:.2f} ~ {p['entry_hi']:.2f}  ← {p['entry_basis']}")
-    tp1_pct, _trail_pct = _mode_tp_tiers(mode, strategy)
-    tp_action = "+6%卖1/3" if strategy == 'S4' else "+4%卖50%"
+    _tp1_pct, tp2_pct, _trail_pct = _mode_tp_tiers(mode, strategy)
+    tp_action = "D1压力位/+2%~2.5%卖50%"
     print(f"  止盈1: {p['tp1']:.2f}  ← {p['tp1_basis']}  │ {tp_action}")
-    print(f"  止盈2: {p['tp2']:.2f}  ← {p['tp2_basis']}")
+    print(f"  止盈2: {p['tp2']:.2f}  ← {p['tp2_basis']} (+{tp2_pct:.0%}档)")
     print(f"  软止损(收盘-1.5%): {p['soft_stop']:.2f}  硬止损: {p['hard_stop']:.2f}  ← {p['stop_basis']}")
     # 盈亏比
     mid_entry = (p['entry_lo'] + p['entry_hi']) / 2
-    reward = p['tp1'] - mid_entry
+    reward = p['tp2'] - mid_entry
     risk = mid_entry - p['hard_stop']
     if risk > 0:
         rr = reward / risk
         rr_tag = "✅" if rr >= 1.25 else "⚠️" if rr >= 1.0 else "❌"
-        print(f"  盈亏比: {rr:.1f}:1 {rr_tag}  (止盈1距离{reward:.2f} / 硬止损距离{risk:.2f})")
+        print(f"  盈亏比: {rr:.1f}:1 {rr_tag}  (强势目标距离{reward:.2f} / 硬止损距离{risk:.2f})")
 
 
 def _print_chip(chip):
@@ -453,6 +553,10 @@ industry_l1_map = {}
 industry_l2_map = {}
 sector_momentum = {}  # 东财三级行业 → 5日动量
 sector_rank = {}
+sector_today_stats = {}  # 东财三级行业 → 当日涨幅/全行业分位/20日量比
+sector_breadth = {}      # 东财三级行业 → 成分股上涨家数/有效家数/上涨占比
+market_index_pct = 0.0   # 三大指数当日涨跌幅均值，用于行业超额强度
+market_index_fresh = False
 try:
     ind_df = pd.read_sql("""
         SELECT s.code,
@@ -474,19 +578,42 @@ try:
         SELECT d.board_code,
                l3.board_name AS industry,
                d.date,
-               d.pctChg AS avg_pct
+               d.pctChg AS avg_pct,
+               d.amount
         FROM em_board_daily d
         JOIN em_board_l3 l3 ON d.board_code = l3.board_code
         WHERE d.level = 3
         ORDER BY d.board_code, d.date
     """, conn)
-    for col in ['avg_pct']:
+    for col in ['avg_pct', 'amount']:
         sec_df[col] = pd.to_numeric(sec_df[col], errors='coerce')
     for ind, grp in sec_df.groupby('industry'):
         grp = grp.sort_values('date').reset_index(drop=True)
         if len(grp) >= 5:
             m5 = float(np.mean(grp['avg_pct'].values[-5:]))
             sector_momentum[ind] = m5
+        if not grp.empty:
+            today_pct = float(grp['avg_pct'].iloc[-1])
+            prior_amount = grp['amount'].iloc[-21:-1].dropna()
+            avg_amount20 = float(prior_amount.mean()) if not prior_amount.empty else 0.0
+            today_amount = float(grp['amount'].iloc[-1]) if pd.notna(grp['amount'].iloc[-1]) else 0.0
+            sector_today_stats[ind] = {
+                'date': str(grp['date'].iloc[-1]),
+                'daily_pct': today_pct,
+                'amount_ratio20': today_amount / avg_amount20 if avg_amount20 > 0 else 0.0,
+                'daily_rank_pct': 0.0,
+            }
+    if sector_today_stats:
+        today_sorted = sorted(
+            (
+                name for name, values in sector_today_stats.items()
+                if values.get('date') == str(_kl_max_date)
+            ),
+            key=lambda name: sector_today_stats[name]['daily_pct'],
+        )
+        denom = max(len(today_sorted) - 1, 1)
+        for i, ind in enumerate(today_sorted):
+            sector_today_stats[ind]['daily_rank_pct'] = i / denom
     # 计算排名百分位
     if sector_momentum:
         sorted_secs = sorted(sector_momentum.items(), key=lambda x: x[1])
@@ -503,6 +630,41 @@ try:
 except Exception as e:
     print(f"  东财三级行业数据加载失败: {e}")
     sector_rank = {}
+
+# M5技术主线例外的“板块同步”与“相对大盘”口径。
+try:
+    latest_date_text = str(_kl_max_date)
+    breadth_counts = {}
+    for code_g, ind in industry_map.items():
+        if not ind:
+            continue
+        kdf = _get_kline(code_g)
+        if kdf.empty or str(kdf['date'].iloc[-1]) != latest_date_text:
+            continue
+        pct_value = float(kdf['pctChg'].iloc[-1])
+        up_count, total_count = breadth_counts.get(ind, (0, 0))
+        breadth_counts[ind] = (up_count + int(pct_value > 0), total_count + 1)
+    for ind, (up_count, total_count) in breadth_counts.items():
+        sector_breadth[ind] = {
+            'up_count': up_count,
+            'total_count': total_count,
+            'breadth': up_count / total_count if total_count else 0.0,
+        }
+
+    index_pcts = []
+    for index_code in ('sh.000001', 'sz.399001', 'sz.399006'):
+        index_df = _get_kline(index_code)
+        if not index_df.empty and str(index_df['date'].iloc[-1]) == latest_date_text:
+            index_pcts.append(float(index_df['pctChg'].iloc[-1]))
+    market_index_fresh = len(index_pcts) == 3
+    market_index_pct = float(np.mean(index_pcts)) if market_index_fresh else 0.0
+    if not market_index_fresh:
+        print("  M5板块超额强度: 三大指数未与个股同日，T5例外将自动关闭")
+except Exception as exc:
+    print(f"  M5板块同步统计失败: {exc}")
+    sector_breadth = {}
+    market_index_pct = 0.0
+    market_index_fresh = False
 
 # === V6.1: 梯队定位 - 计算每只股票在板块内的5日涨幅排名 ===
 stock_tier = {}   # code → {'rank_pct': 0~1, 'tier': '龙头'/'跟风'/'补涨', 'sector_chg5': float}
@@ -717,6 +879,105 @@ def _concept_blocked(concept_meta):
         concept_meta.get('concept_stage') in CONCEPT_HARD_EXCLUDE
         or concept_meta.get('tomorrow_bucket') == TOMORROW_BAN
     )
+
+
+def _is_tech_focus_candidate(candidate):
+    """焦点池按东财二/三级行业精确命中，不用宽泛“科技概念”标签。"""
+    l2 = candidate.get('concept_l2') or industry_l2_map.get(candidate.get('code'), '')
+    l3 = candidate.get('industry') or candidate.get('concept_name') or ''
+    return (
+        l2 in set(TECH_FOCUS_CONFIG.get('l2', []))
+        or l3 in set(TECH_FOCUS_CONFIG.get('l3', []))
+    )
+
+
+def _m5_focus_sector_check(industry, bucket=None):
+    """只判断行业层T5条件，供个股闸门与技术焦点雷达共用。"""
+    failures = []
+    bucket = bucket or _tomorrow_policy_for_industry(industry).get('bucket', TOMORROW_UNKNOWN)
+    if bucket not in set(TECH_FOCUS_RULE.get('allowed_tomorrow_buckets', [])):
+        bucket_short = {
+            TOMORROW_PRIORITY: '优先',
+            TOMORROW_DOWNGRADE: '降权',
+            TOMORROW_BAN: '禁入',
+            TOMORROW_UNKNOWN: '未分级',
+        }.get(bucket, str(bucket))
+        failures.append(f'明日行业档={bucket_short}')
+
+    stats = sector_today_stats.get(industry)
+    breadth = sector_breadth.get(industry)
+    if not market_index_fresh:
+        failures.append('三大指数未与个股同日')
+    if not stats:
+        failures.append('缺行业当日强度')
+    else:
+        if stats.get('date') != str(_kl_max_date):
+            failures.append(f"行业数据滞后至{stats.get('date') or '未知'}")
+        daily_pct = stats.get('daily_pct', 0.0)
+        daily_rank = stats.get('daily_rank_pct', 0.0)
+        amount_ratio = stats.get('amount_ratio20', 0.0)
+        excess = daily_pct - market_index_pct
+        if daily_rank < float(TECH_FOCUS_RULE.get('min_sector_daily_rank_pct', 0.90)):
+            failures.append(f'行业日排名仅{daily_rank:.0%}')
+        if daily_pct <= float(TECH_FOCUS_RULE.get('min_sector_daily_pct', 0.0)):
+            failures.append(f'行业当日{daily_pct:+.2f}%未上涨')
+        if not market_index_fresh or excess < float(TECH_FOCUS_RULE.get('min_excess_vs_index_pct', 2.0)):
+            if market_index_fresh:
+                failures.append(f'行业超额仅{excess:+.2f}pct')
+        if amount_ratio < float(TECH_FOCUS_RULE.get('min_amount_ratio_20', 1.20)):
+            failures.append(f'行业量比仅{amount_ratio:.2f}')
+    if not breadth:
+        failures.append('缺行业成分同步数据')
+    else:
+        breadth_value = breadth.get('breadth', 0.0)
+        up_count = breadth.get('up_count', 0)
+        if breadth_value < float(TECH_FOCUS_RULE.get('min_sector_breadth', 0.55)):
+            failures.append(f'行业上涨占比仅{breadth_value:.0%}')
+        if up_count < int(TECH_FOCUS_RULE.get('min_sector_up_count', 3)):
+            failures.append(f'行业仅{up_count}只上涨')
+
+    if failures:
+        return False, '；'.join(failures)
+    return True, (
+        f"行业{stats['daily_pct']:+.2f}%/日排名{stats['daily_rank_pct']:.0%}/"
+        f"超额{stats['daily_pct'] - market_index_pct:+.2f}pct/量比{stats['amount_ratio20']:.2f}/"
+        f"上涨{breadth['up_count']}/{breadth['total_count']}"
+    )
+
+
+def _m5_focus_exception_check(candidate):
+    """返回(M5技术主线例外是否通过, 原因/证据)。所有条件必须同时成立。"""
+    if MODE.get('mode') != 'M5':
+        return False, '非M5环境'
+    if not MODE.get('m5_focus_exception'):
+        return False, '当前M5不开放例外'
+
+    failures = []
+    phase = MODE.get('cycle_phase', '未知')
+    if phase not in set(TECH_FOCUS_RULE.get('allowed_cycle_phases', [])):
+        failures.append(f'情绪{phase}不开放')
+    if not _is_tech_focus_candidate(candidate):
+        failures.append('不在技术焦点池')
+    if candidate.get('grade') not in set(TECH_FOCUS_RULE.get('allowed_grades', ['A'])):
+        failures.append(f"非{','.join(TECH_FOCUS_RULE.get('allowed_grades', ['A']))}级")
+    if candidate.get('tier') not in set(TECH_FOCUS_RULE.get('allowed_tiers', ['龙头'])):
+        failures.append('非板块前15%龙头')
+    buy_status = candidate.get('_buy_status') or _buy_status_for_candidate(candidate)
+    if buy_status not in set(TECH_FOCUS_RULE.get('allowed_buy_status', ['可买'])):
+        failures.append(f'买点={buy_status}')
+
+    industry = candidate.get('industry') or ''
+    sector_ok, sector_evidence = _m5_focus_sector_check(
+        industry,
+        bucket=candidate.get('tomorrow_bucket', TOMORROW_UNKNOWN),
+    )
+    if not sector_ok:
+        failures.append(sector_evidence)
+
+    if failures:
+        return False, '；'.join(failures)
+
+    return True, sector_evidence
 
 # === 大盘环境 ===
 print("=" * 80)
@@ -1629,7 +1890,7 @@ else:
 # ═══════════════════════════════════════════════════════════════
 print()
 print("=" * 80)
-print("  V10主线趋势版 最终推荐（同行业不去重 + 仓位修正）")
+print("  V11板块优先版 形态池 + v7狙击执行层")
 print("=" * 80)
 
 # 合并所有候选
@@ -1674,6 +1935,11 @@ def get_strategy_priority(c):
 buy_status_priority = {'可买': 0, '小仓': 1, '等回踩': 2, '等确认': 3, '仅观察': 4}
 for c in all_candidates:
     c['_buy_status'] = _buy_status_for_candidate(c)
+    eligible, evidence = _m5_focus_exception_check(c)
+    c['_m5_exception_eligible'] = eligible
+    c['_m5_exception_evidence'] = evidence
+    c['_strategy_priority'] = get_strategy_priority(c)
+    c['_continuation_score'] = continuation_score(c)
     c['boom_tier']  = _boom_tier(c['code'])          # 中报景气档 1~4 / None=中性
     c['boom_label'] = _BOOM_LABEL.get(c['boom_tier'], '·')
 
@@ -1683,8 +1949,10 @@ def get_boom_priority(c):            # 越小越靠前：T1 > T2 > 中性/T3 > T
 def _boom_score_band(c):            # 分数分档：|差|≤BAND 视为同档，让"相近分"并列
     return -(round(c['score'] / BOOM_SCORE_BAND))
 def _merge_sort_key(x, boom):
-    # 前段优先级: 买点状态 > 策略角色 > 明日行业档 > 概念阶段 > 主线 > 龙头；景气仅在"同龙头、相近分"内插队
-    head = (buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x),
+    # M5先排可执行的技术主线例外；其余环境沿用买点状态优先。
+    m5_exception_order = 0 if x.get('_m5_exception_eligible') else 1
+    head = ((m5_exception_order,) if MODE.get('mode') == 'M5' else ()) + (
+            buy_status_priority.get(x.get('_buy_status'), 9), get_strategy_priority(x),
             get_tomorrow_priority(x), get_concept_priority(x), get_mainline_bias(x), 0 if x.get('tier') == '龙头' else 1)
     if boom:
         return head + (_boom_score_band(x), get_boom_priority(x), -x['score'])
@@ -1696,23 +1964,59 @@ dedup_results = sorted(all_candidates, key=lambda x: _merge_sort_key(x, BOOM_TIL
 
 # 仓位修正提示
 pos_mod = MODE.get('position_modifier', 1.0)
+execution_targets = select_execution_targets(dedup_results, MODE.get('mode'), pos_mod, limit=2)
 if pos_mod < 1.0:
     print(f"\n  ⚠️ 情绪周期警告: {MODE['cycle_phase']}(得分{MODE['cycle_score']}/12)")
-    print(f"  ⚠️ 仓位修正器: {pos_mod} {'→ 仓位减半！' if pos_mod == 0.5 else '→ 禁止开仓！' if pos_mod == 0 else ''}")
+    if pos_mod == 0:
+        modifier_text = '→ 禁止开仓！'
+    elif pos_mod == 0.5:
+        modifier_text = '→ 仓位减半！'
+    else:
+        modifier_text = '→ 普通候选仅观察；技术主线例外优先1/12、降权1/16！'
+    print(f"  ⚠️ 仓位修正器: {pos_mod:.2f} {modifier_text}")
     if MODE.get('cycle_warning'):
         print(f"  ⚠️ {MODE['cycle_warning']}")
     print()
 
+print("\n" + "═" * 80)
+print("  🎯 实盘狙击授权（主狙击1只 + 备用1只）")
+print("═" * 80)
+if execution_targets:
+    for index, candidate in enumerate(execution_targets):
+        role_name = "主狙击" if index == 0 else "备用"
+        plan = _candidate_plan(candidate)
+        tail = candidate.get('_tail_confirmation', {})
+        tail_text = ' / '.join(tail.get('labels', [])) or '尾盘确认缺失'
+        print(
+            f"  {role_name}: {candidate['code']}  {candidate.get('strategy', '?')}-{candidate.get('grade', '?')}  "
+            f"状态={candidate.get('_buy_status')}  D1延续分={candidate.get('_continuation_score', 0)}/100"
+        )
+        print(
+            f"    买入区 {plan['entry_lo']:.2f}~{plan['entry_hi']:.2f}  仓位={_position_for_candidate(candidate, pos_mod=pos_mod)}  "
+            f"尾盘确认={candidate.get('_tail_confirm_count', 0)}/3"
+        )
+        print(
+            f"    D1先兑现 {plan['tp1']:.2f}卖50%  强势目标 {plan['tp2']:.2f}  "
+            f"硬止损 {plan['hard_stop']:.2f}  │ {tail_text}"
+        )
+    print("  执行铁律：只有D0尾盘实际成交的主狙击/备用才转持仓；备用不与主狙击同时下单。")
+else:
+    print("  今日无实盘狙击单。下方只是形态观察池，不结转为D1卖出计划。")
+
 if dedup_results:
-    print(f"\n  候选推荐: {len(dedup_results)} 只 (按优先级排序,同行业不去重,同板块多票按序自行取舍)")
-    print(f"  {'排名':>4s} {'策略':>4s} {'代码':<12s} {'价格':>7s} {'评分':>6s} {'梯队':>4s} {'景气':>4s} {'板块':>12s} {'明日档':>6s} {'概念阶段':>10s} {'买点/仓位'}")
-    print("-" * 125)
+    print(f"\n  形态观察池: {len(dedup_results)} 只（非实盘授权；实盘只认上方主狙击/备用）")
+    print(f"  {'排名':>4s} {'策略':>4s} {'代码':<12s} {'价格':>7s} {'评分':>6s} {'梯队':>4s} {'板块':>12s} {'尾确':>5s} {'延续':>5s} {'明日档':>6s} {'狙击':>4s} {'概念阶段':>10s} {'买点/仓位'}")
+    print("-" * 150)
     for rank, c in enumerate(dedup_results[:15], 1):
         tier_tag = c.get('tier', '—')
         rot_tag = '🔺' if c.get('rot_bonus', 0) > 0 else ('🔻' if c.get('rot_bonus', 0) < 0 else '')
         ind_short = (c.get('industry') or '')[:10]
         s_tag = c.get('strategy', '?')
-        if pos_mod == 0:
+        if MODE.get('mode') == 'M5' and c.get('_m5_exception_eligible'):
+            advice = f"✅{c.get('_buy_status')}｜{_position_for_candidate(c, pos_mod=pos_mod)}"
+        elif MODE.get('mode') == 'M5':
+            advice = f"👀仅观察｜{c.get('_m5_exception_evidence', '未通过M5技术主线闸门')}"
+        elif pos_mod == 0:
             advice = '❌禁止开仓'
         else:
             advice = f"{c.get('_buy_status', _buy_status_for_candidate(c))}｜{_position_for_candidate(c, pos_mod=pos_mod)}"
@@ -1724,11 +2028,51 @@ if dedup_results:
         if c.get('concept_name'):
             concept_text = f"{concept_text}:{c['concept_name'][:6]}"
         tomorrow_text = _tomorrow_bucket_short(c)
+        sniper_tag = '✅' if c.get('_m5_exception_eligible') else ('—' if MODE.get('mode') != 'M5' else '👀')
         fam = c.get('family', '')
         fam_tag = f" 〔{fam}·{c.get('family_status','')}{c.get('family_active_days20',0)}/20〕" if fam else ''
-        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {c.get('boom_label','·'):>4s} {ind_short:>12s}{rot_tag} {tomorrow_text:>6s} {concept_text:>10s}{fam_tag}  {advice}")
+        tail_text = f"{c.get('_tail_confirm_count', 0)}/3" if c.get('_buy_status') in ('可买', '小仓', '仅观察') else '—'
+        print(f"  {rank:>3d} {s_tag:>4s} {c['code']:<12s} {c['price']:>7.2f} {score_text:>6s} {tier_tag:>4s} {ind_short:>12s}{rot_tag} {tail_text:>5s} {c.get('_continuation_score',0):>4d} {tomorrow_text:>6s} {sniper_tag:>4s} {concept_text:>10s}{fam_tag}  {advice}")
 else:
-    print("\n  （无最终推荐候选）")
+    print("\n  （无形态观察候选）")
+
+if MODE.get('mode') == 'M5':
+    m5_passed = [c for c in dedup_results if c.get('_m5_exception_eligible')]
+    print("\n  ── M5技术主线狙击闸门 ──")
+    focus_l2 = set(TECH_FOCUS_CONFIG.get('l2', []))
+    focus_l3 = set(TECH_FOCUS_CONFIG.get('l3', []))
+    focus_industries = {
+        ind for code_g, ind in industry_map.items()
+        if ind and (industry_l2_map.get(code_g, '') in focus_l2 or ind in focus_l3)
+    }
+    focus_industries = sorted(
+        focus_industries,
+        key=lambda ind: sector_today_stats.get(ind, {}).get('daily_pct', -999),
+        reverse=True,
+    )
+    if focus_industries:
+        print("  技术焦点行业雷达（行业层通过≠个股可买，仍需A级/龙头/买入区）：")
+        for ind in focus_industries:
+            policy = _tomorrow_policy_for_industry(ind)
+            sector_ok, sector_note = _m5_focus_sector_check(ind, bucket=policy.get('bucket'))
+            bucket_text = {
+                TOMORROW_PRIORITY: '优先',
+                TOMORROW_DOWNGRADE: '降权',
+                TOMORROW_BAN: '禁入',
+                TOMORROW_UNKNOWN: '—',
+            }.get(policy.get('bucket'), '—')
+            print(f"    {'✅' if sector_ok else '· '} {ind:<14s} 明日{bucket_text:<2s}  {sector_note}")
+    if m5_passed:
+        print("  通过: " + ", ".join(f"{c['code']}[{c.get('industry', '')}]" for c in m5_passed))
+        print(
+            f"  执行上限: 明日优先单票{TECH_FOCUS_RULE.get('priority_position', '1/12')}，"
+            f"降权行业{TECH_FOCUS_RULE.get('downgrade_position', '1/16')}；"
+            f"同三级最多{TECH_FOCUS_RULE.get('max_same_l3_positions', 1)}只；"
+            f"技术焦点总暴露≤{TECH_FOCUS_RULE.get('max_total_focus_exposure', '1/4')}；"
+            f"当日最多新开{TECH_FOCUS_RULE.get('max_new_positions', 2)}只。"
+        )
+    else:
+        print("  无票同时满足技术焦点、行业逆势强度、板块同步、A级前排和合法买入区；今日仍不交易。")
 
 # ═══ 景气加权 影子对照榜（Phase1·2026-07-03加·纯展示不改实盘排序/不下单）═══
 # 见 交易体系/景气倾斜因子_设计.md。↑/↓=相对上面实盘榜的名次变化，用于眼验是否更优。
@@ -1757,29 +2101,43 @@ if dedup_results and _boomed and not BOOM_TILT_ACTIVE:
 #   震荡弱市(M1/M2)→快进快出(严格等回踩/早盘就卖)。开盘瞬间通常不高(高开仅~36%)，冲高在盘中，用限价接。
 _exec_mode = MODE['mode']
 _strong = _exec_mode in ('M3', 'M4')
-_regime_tag = '强势·顺势拿' if _strong else ('极端·禁开仓' if _exec_mode == 'M5' else '震荡/弱·快进快出')
+_m5_exec_candidates = [c for c in dedup_results if c.get('_m5_exception_eligible')]
+_regime_tag = '强势·顺势拿' if _strong else ('极端·技术主线例外' if _exec_mode == 'M5' else '震荡/弱·快进快出')
 print("\n" + "═" * 80)
 print(f"  ⏱️  尾盘执行提醒   行情档={_exec_mode}·{_regime_tag}   (回测校准建议·非硬规则)")
 print("═" * 80)
-if pos_mod == 0 or _exec_mode == 'M5':
-    print("  情绪=退潮/过热 或 M5 → 今日禁止开仓，仅做持仓管理与下方早盘出场。")
+if _exec_mode == 'M5':
+    if _m5_exec_candidates:
+        print("  M5普通候选全部仅观察；只有上方标✅的技术主线例外可小仓试错（优先1/12、降权1/16），未标✅不得开仓。")
+        print("  同三级行业只取排名最前1只；盘后收盘价超买入区、板块尾盘回落或已有同方向暴露 → 放弃。")
+    else:
+        print("  M5技术主线闸门无人通过 → 今日禁止开仓，仅做持仓管理与下方早盘出场。")
+elif pos_mod == 0:
+    print("  当前情绪不开放任何例外 → 今日禁止开仓，仅做持仓管理与下方早盘出场。")
 else:
     print("  ── 进场（按每票买点状态）──")
     print("   · 可买   → 尾盘 14:40-14:55 直接买（现价已在买入区内）")
-    print("   · 小仓   → 尾盘半仓；尾盘四项确认不足则放弃")
+    print("   · 小仓   → 尾盘降仓执行；三项确认仅2/3，不得升级为可买")
     if _strong:
         print("   · 等回踩 → [强市] 尾盘半仓即时 + 另半仓挂回踩区限价；到价前复核大盘/板块未转弱再留单，追不到只持半仓不补")
     else:
         print("   · 等回踩 → [震荡/弱] 回踩到区间先复核(大盘/板块/是否放量破位)再手动买，别盲挂自动成交限价；追不到记『错过』放弃")
     print("   · 等确认 → 等放量站回区间再动；  仅观察 → 不买")
     print("   · ⚠️ 到买入价≠可买: 放量跌破区下沿 / 竞价低开>3% / 板块转退潮 / 大盘跳水  任一 → 放弃或暂缓, 别盲接")
-print("  ── 次日早盘出场（先挂半仓限价，捕捉冲高）──")
-print("   · 全档: 开盘即挂 +2~2.5% 限价先卖一半（回测成交率~40%，成交均价≈+2.2%）")
-if _strong:
-    print("   · [强市] 剩半仓移动止盈(最高回落2.5~3%)让它跑到 D2，别急着封顶(回测D2持有更优)")
+if execution_targets:
+    print("  ── D1早盘出场（仅适用于D0已实际成交的狙击单）──")
+    print("   · 全档: 开盘即挂计划压力位/+2~2.5% 限价先卖50%（回测成交率~40%，成交均价≈+2.2%）")
+    if _strong:
+        print("   · [强市] 剩余仓移动止盈(最高回落2.5~3%)让它跑到 D2")
+    else:
+        print("   · [震荡/弱] 剩余仓早盘走弱/冲高回落即清，别死等 D2")
+    print("   · 提醒: 冲高在盘中不在开盘瞬间，用限价接，别市价挂开盘")
 else:
-    print("   · [震荡/弱] 剩半仓早盘走弱/冲高回落即一起清，别死等 D2（回测D2会还回利润）")
-print("   · 提醒: 『冲高』在盘中不在开盘瞬间(高开仅~36%)，用限价接，别市价挂在开盘")
+    print("  ── D1出场计划：无（D0无实盘狙击授权）──")
+
+print("  ── 今日不交易条件 ──")
+print("   · 行业=禁入；不在技术焦点池；板块仅单票独涨；行业未进当日前10%；行业未放量；个股非A级前排")
+print("   · 收盘价不在买入区；盈亏比不足；涨/跌停；同日卖出又买回；已有同三级持仓或技术焦点总暴露将超过1/4")
 
 conn.close()
 print("\n分析完成。")

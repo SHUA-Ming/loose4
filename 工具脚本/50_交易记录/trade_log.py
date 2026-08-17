@@ -5,8 +5,9 @@
 
 最常用：
     python 工具脚本/50_交易记录/trade_log.py buy 002015 协鑫能科 23.02 --strategy S4 --grade A --score 8 --shares 400 --entry 22.54 23.14 --stop 22.31 --soft-stop 22.66 --target 24.38 --target2 25.07 --pos 1/16 --confidence 中 --evidence "M3+主线发酵+S4达标" --invalidation "跌破MA5且概念转弱" --remark "按计划竞价买入"
-    python 工具脚本/50_交易记录/trade_log.py sell 1 24.38 --reason 止盈1 --rule 1 --remark "到+6%卖1/3"
+    python 工具脚本/50_交易记录/trade_log.py cashout 1 24.38 --shares 200 --reason D1首次兑现 --rule 1 --remark "到压力位/+2%~2.5%卖50%"
     python 工具脚本/50_交易记录/trade_log.py review 1 --result 买点正确 --pnl-1d 3.2 --pnl-3d 5.8 --notes "次日冲高到目标位，未触发反证"
+    python 工具脚本/50_交易记录/trade_log.py authorize-hold 1 --price 24.80 --protect 24.10 --next-target 26.00 --until 2026-08-11 --checks market,sector,price_volume,reward_risk --evidence "主线延续且尾盘承接" --invalidation "板块退潮或放量跌破保护线"
     python 工具脚本/50_交易记录/trade_log.py calibration --by confidence
     python 工具脚本/50_交易记录/trade_log.py open
     python 工具脚本/50_交易记录/trade_log.py history
@@ -35,7 +36,10 @@ from db_cache import add_trade, close_trade, get_connection, get_open_trades, ge
 
 # 当前系统版本号：每次改动选股/风控/情绪逻辑就 +1，并在《交易体系/系统变更日志.md》记一条。
 # buy 不显式传 --sysver 时自动打这个版本，保证每笔都带版本、月末能按版本分段校准。
-CURRENT_SYSVER = 'v5'
+CURRENT_SYSVER = 'v8'
+
+ROLLING_CHECKS = {"market", "sector", "relative", "price_volume", "reward_risk"}
+ROLLING_REQUIRED = {"market", "sector", "price_volume", "reward_risk"}
 
 
 def today_str():
@@ -177,6 +181,114 @@ def _infer_horizon(row):
     return None
 
 
+def _parse_iso_date(value):
+    try:
+        return dt.datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _parse_hold_checks(value):
+    if isinstance(value, (list, tuple, set)):
+        items = value
+    else:
+        items = str(value or "").split(",")
+    return {str(item).strip() for item in items if str(item).strip()}
+
+
+def validate_hold_authorization(
+    trade,
+    current_price,
+    protect_price,
+    next_target,
+    checks,
+    auth_date,
+    auth_until,
+    evidence,
+    invalidation,
+):
+    """R1滚动持有授权的纯校验；返回(errors, normalized_checks)。"""
+    errors = []
+    normalized = _parse_hold_checks(checks)
+    unknown = normalized - ROLLING_CHECKS
+    missing_required = ROLLING_REQUIRED - normalized
+    buy_price = float(trade.get("buy_price") or 0)
+    prior_protect = trade.get("hold_protect_price")
+    prior_protect = None if _is_blank(prior_protect) else float(prior_protect)
+    cashout_done = int(trade.get("hold_cashout_done") or 0) == 1
+    auth_day = _parse_iso_date(auth_date)
+    until_day = _parse_iso_date(auth_until)
+
+    if not cashout_done:
+        errors.append("必须先完成D1首次兑现，再授权剩余仓滚动持有")
+    if buy_price <= 0:
+        errors.append("交易记录缺买入价")
+    elif current_price < buy_price * 1.02:
+        errors.append(f"当前盈利不足+2%（授权线 {buy_price * 1.02:.2f}）")
+    if unknown:
+        errors.append("未知检查项: " + ",".join(sorted(unknown)))
+    if len(normalized) < 4:
+        errors.append("五项检查至少通过4项")
+    if missing_required:
+        errors.append("必过项缺失: " + ",".join(sorted(missing_required)))
+    if buy_price > 0 and protect_price < buy_price * 1.01:
+        errors.append(f"保护线必须至少锁定成本+1%（最低 {buy_price * 1.01:.2f}）")
+    if protect_price >= current_price:
+        errors.append("保护线必须低于当前价")
+    if prior_protect is not None and protect_price < prior_protect:
+        errors.append(f"保护线只能上移，不能低于上次 {prior_protect:.2f}")
+    if next_target <= current_price:
+        errors.append("下一目标/压力位必须高于当前价")
+    elif protect_price < current_price:
+        reward_risk = (next_target - current_price) / (current_price - protect_price)
+        if reward_risk < 1.5:
+            errors.append(f"剩余赔率不足1.5（当前 {reward_risk:.2f}）")
+    if _is_blank(evidence):
+        errors.append("必须写明R1事实证据")
+    if _is_blank(invalidation):
+        errors.append("必须写明R1失效条件")
+    if auth_day is None or until_day is None:
+        errors.append("授权日期格式必须为 YYYY-MM-DD")
+    elif until_day <= auth_day:
+        errors.append("授权截止日必须晚于授权日")
+    elif (until_day - auth_day).days > 7:
+        errors.append("单次授权最长7个自然日；原则上只覆盖下一交易日")
+    return errors, normalized
+
+
+def _rolling_auth_active(row, as_of):
+    if str(row.get("hold_status") or "") != "rolling":
+        return False
+    checks = _parse_hold_checks(row.get("hold_auth_checks"))
+    score = 0 if _is_blank(row.get("hold_auth_score")) else int(row.get("hold_auth_score"))
+    cashout_done = int(row.get("hold_cashout_done") or 0) == 1
+    buy_price = 0 if _is_blank(row.get("buy_price")) else float(row.get("buy_price"))
+    auth_price = 0 if _is_blank(row.get("hold_auth_price")) else float(row.get("hold_auth_price"))
+    protect = 0 if _is_blank(row.get("hold_protect_price")) else float(row.get("hold_protect_price"))
+    next_target = 0 if _is_blank(row.get("hold_next_target")) else float(row.get("hold_next_target"))
+    reward_risk = 0 if _is_blank(row.get("hold_reward_risk")) else float(row.get("hold_reward_risk"))
+    auth_day = _parse_iso_date(row.get("hold_auth_date"))
+    until_day = _parse_iso_date(row.get("hold_auth_until"))
+    as_of_day = _parse_iso_date(as_of)
+    return all([
+        cashout_done,
+        score >= 4,
+        ROLLING_REQUIRED.issubset(checks),
+        buy_price > 0,
+        auth_price >= buy_price * 1.02,
+        protect >= buy_price * 1.01,
+        protect < auth_price < next_target,
+        reward_risk >= 1.5,
+        auth_day is not None,
+        until_day is not None,
+        as_of_day is not None,
+        until_day > auth_day,
+        until_day >= as_of_day,
+        not _is_blank(row.get("hold_auth_evidence")),
+        not _is_blank(row.get("hold_auth_invalidation")),
+    ])
+
+
 def _current_mode_snapshot():
     try:
         from market_mode import get_mode_params
@@ -260,6 +372,141 @@ def cmd_sell(args):
         print(f"未找到 ID={args.id} 的记录。")
 
 
+def cmd_cashout(args):
+    """记录首次部分兑现；保留交易为open，供剩余仓继续管理。"""
+    init_db()
+    cashout_date = args.date or today_str()
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT id,code,name,buy_price,shares,remaining_shares,status,sell_date,hold_cashout_done
+        FROM trade_log WHERE id=%s
+        """,
+        (args.id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise SystemExit(f"未找到交易 ID={args.id}")
+    trade_id, code, name, buy_price, original_shares, remaining_shares, status, sell_date, cashout_done = row
+    if str(status or "") != "open" or sell_date is not None:
+        conn.close()
+        raise SystemExit(f"ID={args.id} 已平仓，不能记录部分兑现")
+    if int(cashout_done or 0) == 1:
+        conn.close()
+        raise SystemExit(f"ID={args.id} 已记录首次兑现；后续卖完请用 sell，不能重复记首次兑现")
+    remaining = remaining_shares if remaining_shares is not None else original_shares
+    if remaining is None or int(remaining) <= 0:
+        conn.close()
+        raise SystemExit(f"ID={args.id} 缺持仓股数，先补齐 shares 后再记录部分兑现")
+    if args.shares <= 0 or args.shares >= int(remaining):
+        conn.close()
+        raise SystemExit(f"部分兑现股数必须在1~{int(remaining)-1}之间；全部卖完请用 sell")
+    if not buy_price or buy_price <= 0:
+        conn.close()
+        raise SystemExit(f"ID={args.id} 缺买入价，无法计算已实现利润")
+
+    new_remaining = int(remaining) - args.shares
+    realized = round((args.price - float(buy_price)) * args.shares, 2)
+    note = args.reason or "D1首次兑现"
+    if args.remark:
+        note += f"·{args.remark}"
+    conn.execute(
+        """
+        UPDATE trade_log
+        SET remaining_shares=%s, hold_cashout_done=1,
+            first_cashout_date=%s, first_cashout_price=%s, first_cashout_shares=%s,
+            realized_pnl_amount=COALESCE(realized_pnl_amount,0)+%s,
+            remark=CONCAT(IFNULL(remark,''), IF(remark IS NULL OR remark='', '', '; '), %s),
+            follow_rule=%s
+        WHERE id=%s
+        """,
+        (new_remaining, cashout_date, args.price, args.shares, realized, note, args.rule, args.id),
+    )
+    conn.commit()
+    conn.close()
+    print(f"OK: 首次部分兑现已记录 ID={trade_id}  {code} {name or ''}")
+    print(f"  {cashout_date} 卖出 {args.shares}股 @ {args.price:.2f}  已实现盈亏 {realized:+.2f}")
+    print(f"  原始 {int(original_shares or remaining)}股  剩余 {new_remaining}股  交易保持open")
+
+
+def cmd_authorize_hold(args):
+    """给已首次兑现的盈利剩余仓签发一次R1滚动持有授权。"""
+    init_db()
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT id,code,name,buy_price,status,sell_date,hold_protect_price,hold_auth_count,
+               hold_cashout_done,remaining_shares
+        FROM trade_log WHERE id=%s
+        """,
+        (args.id,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise SystemExit(f"未找到交易 ID={args.id}")
+    trade = {
+        "id": row[0], "code": row[1], "name": row[2], "buy_price": row[3],
+        "status": row[4], "sell_date": row[5], "hold_protect_price": row[6],
+        "hold_auth_count": row[7] or 0, "hold_cashout_done": row[8] or 0,
+        "remaining_shares": row[9],
+    }
+    if str(trade["status"] or "") != "open" or trade["sell_date"] is not None:
+        conn.close()
+        raise SystemExit(f"ID={args.id} 已平仓，不能授权持有")
+
+    auth_date = args.as_of or today_str()
+    errors, checks = validate_hold_authorization(
+        trade=trade,
+        current_price=args.price,
+        protect_price=args.protect,
+        next_target=args.next_target,
+        checks=args.checks,
+        auth_date=auth_date,
+        auth_until=args.until,
+        evidence=args.evidence,
+        invalidation=args.invalidation,
+    )
+    if errors:
+        conn.close()
+        print("R1滚动持有授权被拦截：")
+        for error in errors:
+            print(f"  - {error}")
+        raise SystemExit(2)
+
+    score = len(checks)
+    check_text = ",".join(sorted(checks))
+    reward_risk = (args.next_target - args.price) / (args.price - args.protect)
+    evidence = f"checks={check_text}; cashout_done=yes; {args.evidence}".strip()
+    note = f"R1授权{auth_date}→{args.until};保护线{args.protect:.2f};目标{args.next_target:.2f};RR{reward_risk:.2f};{score}/5"
+    conn.execute(
+        """
+        UPDATE trade_log
+        SET hold_status='rolling', hold_auth_date=%s, hold_auth_until=%s,
+            hold_auth_score=%s, hold_cashout_done=1, hold_auth_checks=%s,
+            hold_auth_price=%s, hold_protect_price=%s, hold_next_target=%s,
+            hold_reward_risk=%s, hold_auth_evidence=%s,
+            hold_auth_invalidation=%s, hold_auth_count=COALESCE(hold_auth_count,0)+1,
+            hold_auth_sysver=%s,
+            remark=CONCAT(IFNULL(remark,''), IF(remark IS NULL OR remark='', '', '; '), %s)
+        WHERE id=%s
+        """,
+        (
+            auth_date, args.until, score, check_text, args.price, args.protect,
+            args.next_target, reward_risk, evidence,
+            args.invalidation, CURRENT_SYSVER, note, args.id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    print(f"OK: R1滚动持有已授权 ID={args.id}  {trade['code']} {trade['name'] or ''}")
+    print(f"  授权: {auth_date} → {args.until}  得分 {score}/5  当前价 {args.price:.2f}")
+    print(f"  利润保护线: {args.protect:.2f}  下一目标: {args.next_target:.2f}  剩余赔率: {reward_risk:.2f}")
+    print(f"  检查项: {check_text}")
+    print(f"  证据: {args.evidence}")
+    print(f"  失效: {args.invalidation}")
+    print("  到期前必须重新授权；未续签则恢复D2/D3默认退出。")
+
+
 def cmd_open(_args):
     init_db()
     df = get_open_trades()
@@ -268,9 +515,13 @@ def cmd_open(_args):
         return
     cols = [
         'id', 'code', 'name', 'strategy', 'sysver', 'grade', 'score', 'buy_date', 'buy_price',
-        'shares', 'amount', 'entry_low', 'entry_high', 'stop_price', 'soft_stop',
+        'shares', 'remaining_shares', 'amount', 'entry_low', 'entry_high', 'stop_price', 'soft_stop',
         'target_price', 'target2_price', 'position', 'confidence_level',
-        'invalidation_condition', 'remark'
+        'invalidation_condition', 'hold_cashout_done', 'first_cashout_date',
+        'first_cashout_price', 'first_cashout_shares', 'realized_pnl_amount',
+        'hold_status', 'hold_auth_until', 'hold_auth_score',
+        'hold_auth_price', 'hold_protect_price', 'hold_next_target', 'hold_reward_risk',
+        'hold_auth_count', 'remark'
     ]
     cols = [col for col in cols if col in df.columns]
     print(df[cols].to_string(index=False))
@@ -295,8 +546,6 @@ def cmd_audit_open(_args):
     required_cols = [
         ('strategy', '策略'),
         ('market_mode', '买入M档'),
-        ('entry_low', '买入区下沿'),
-        ('entry_high', '买入区上沿'),
         ('stop_price', '硬止损'),
         ('soft_stop', '软止损'),
         ('position', '仓位'),
@@ -307,14 +556,32 @@ def cmd_audit_open(_args):
     total_issues = 0
     for _, row in df.iterrows():
         issues = []
-        missing = [label for col, label in required_cols if col not in row or _is_blank(row[col])]
+        buy_status = str(row.get('buy_status') or '').strip()
+        no_valid_entry = any(tag in buy_status for tag in ('不合规', '无策略匹配', '应放弃', '放弃', '仅观察'))
+        row_required_cols = list(required_cols)
+        if not no_valid_entry:
+            row_required_cols.extend([
+                ('entry_low', '买入区下沿'),
+                ('entry_high', '买入区上沿'),
+            ])
+        missing = [label for col, label in row_required_cols if col not in row or _is_blank(row[col])]
         if missing:
             issues.append("缺字段: " + "/".join(missing))
 
         age = _trading_age(row.get('buy_date'), trade_dates)
         horizon = _infer_horizon(row)
+        rolling_active = _rolling_auth_active(row, latest_trade_date)
         if horizon is not None and age is not None and age >= horizon:
-            issues.append(f"D{horizon}到期: 已持有D{age}")
+            if rolling_active:
+                print(
+                    f"R1有效 ID={row.get('id')} {row.get('code')} {row.get('name')}  "
+                    f"授权至{str(row.get('hold_auth_until'))[:10]}  "
+                    f"得分{int(row.get('hold_auth_score'))}/5  "
+                    f"保护线{money_text(row.get('hold_protect_price'))}"
+                )
+            else:
+                suffix = "，滚动授权已过期/无效" if str(row.get('hold_status') or '') == 'rolling' else "，未获R1授权"
+                issues.append(f"D{horizon}到期: 已持有D{age}{suffix}")
         elif horizon is None and age is not None and age >= 2:
             issues.append(f"未写D2/D3周期: 已持有D{age}, 需人工确认是否到期")
 
@@ -348,7 +615,10 @@ def cmd_history(args):
     cols = [
         'id', 'code', 'name', 'strategy', 'sysver', 'grade', 'score', 'buy_date', 'buy_price',
         'sell_date', 'sell_price', 'sell_reason', 'pnl_pct', 'pnl_amount',
-        'confidence_level', 'review_result', 'follow_rule', 'remark'
+        'confidence_level', 'first_cashout_date', 'first_cashout_price',
+        'first_cashout_shares', 'realized_pnl_amount', 'hold_status',
+        'hold_auth_count', 'hold_auth_sysver',
+        'review_result', 'follow_rule', 'remark'
     ]
     cols = [col for col in cols if col in df.columns]
     print(df[cols].to_string(index=False))
@@ -390,6 +660,7 @@ def cmd_calibration(args):
         'strategy': 'strategy',
         'mode': 'market_mode',
         'version': 'sysver',
+        'hold': 'hold_status',
     }
     group_col = group_map[args.by]
     conn = get_connection()
@@ -486,6 +757,31 @@ def build_parser():
     sell_parser.add_argument('--remark', default='', help='备注')
     sell_parser.set_defaults(func=cmd_sell)
 
+    cashout_parser = sub.add_parser('cashout', help='记录D1首次部分兑现；不关闭交易，剩余仓可申请R1')
+    cashout_parser.add_argument('id', type=int, help='未平仓交易ID')
+    cashout_parser.add_argument('price', type=float, help='实际兑现价格')
+    cashout_parser.add_argument('--shares', type=int, required=True, help='本次实际卖出股数；必须小于当前剩余股数')
+    cashout_parser.add_argument('--reason', default='D1首次兑现', help='兑现原因')
+    cashout_parser.add_argument('--rule', type=int, default=1, help='是否遵守纪律 1=是 0=否')
+    cashout_parser.add_argument('--date', help='兑现日期 YYYY-MM-DD')
+    cashout_parser.add_argument('--remark', default='', help='备注')
+    cashout_parser.set_defaults(func=cmd_cashout)
+
+    hold_parser = sub.add_parser('authorize-hold', help='给已首次兑现的盈利剩余仓签发一次R1滚动持有授权')
+    hold_parser.add_argument('id', type=int, help='未平仓交易ID')
+    hold_parser.add_argument('--price', type=float, required=True, help='授权时当前价/收盘价，必须至少盈利2%%')
+    hold_parser.add_argument('--protect', type=float, required=True, help='新的利润保护线，至少成本+1%%且只能上移')
+    hold_parser.add_argument('--next-target', type=float, required=True, help='下一压力位/兑现目标；相对保护线的剩余赔率必须≥1.5')
+    hold_parser.add_argument('--until', required=True, help='授权截止日 YYYY-MM-DD，原则上为下一交易日')
+    hold_parser.add_argument('--as-of', help='授权日期 YYYY-MM-DD，默认今天')
+    hold_parser.add_argument(
+        '--checks', required=True,
+        help='通过项，逗号分隔：market,sector,relative,price_volume,reward_risk；至少4项，且除relative外四项必过',
+    )
+    hold_parser.add_argument('--evidence', required=True, help='延长持有的事实证据')
+    hold_parser.add_argument('--invalidation', required=True, help='授权失效条件')
+    hold_parser.set_defaults(func=cmd_authorize_hold)
+
     open_parser = sub.add_parser('open', help='查看当前未平仓记录')
     open_parser.set_defaults(func=cmd_open)
 
@@ -507,7 +803,7 @@ def build_parser():
     review_parser.set_defaults(func=cmd_review)
 
     calibration_parser = sub.add_parser('calibration', help='按置信度/策略/模式统计预测校准表现')
-    calibration_parser.add_argument('--by', choices=['confidence', 'strategy', 'mode', 'version'], default='confidence', help='分组字段')
+    calibration_parser.add_argument('--by', choices=['confidence', 'strategy', 'mode', 'version', 'hold'], default='confidence', help='分组字段')
     calibration_parser.set_defaults(func=cmd_calibration)
 
     stats_parser = sub.add_parser('stats', help='查看胜率/盈亏/纪律统计')

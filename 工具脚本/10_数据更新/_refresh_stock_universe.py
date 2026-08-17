@@ -58,8 +58,8 @@ def _iter_market_symbols():
     # 深市主板/中小板 00xxxx
     for num in range(1, 4000):
         yield f"sz{num:06d}"
-    # 创业板 30xxxx
-    for num in range(300000, 302000):
+    # 创业板 30xxxx（覆盖完整六位代码空间；不能只枚举300/301段）
+    for num in range(300000, 310000):
         yield f"sz{num:06d}"
 
 

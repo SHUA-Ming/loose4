@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-市场模式自动识别 (V10主线趋势版)
+市场模式自动识别 (V11板块优先版)
 判定当前属于 M1磨底 / M2震荡 / M3反弹 / M4强趋势 / M5极端
 输出对应的策略角色、板块准入线、S3 X2阈值等参数
 
 当前能力：
   - 集成情绪周期判定（涨停生态）
   - 高潮日/分歧日自动降级仓位
+  - M5/退潮保留A级扫描，仅给技术焦点强板块小仓例外
   - 板块轮动预判输出
-    - V8策略角色与板块准入线
+  - V8策略角色与板块准入线
 
 可独立运行查看结果，也可被 offline_screener.py import 调用
 """
@@ -73,10 +74,11 @@ MODE_CONFIG = {
     },
     'M5': {
         'name': '过热/恐慌', 'emoji': '⛔',
-        'desc': '极端行情，空仓观望',
-        'strategies': {'S1': 'disabled', 'S2': 'disabled', 'S3': 'disabled', 'S4': 'disabled'},
-        'sector_cutoff': {'S1': None, 'S2': None, 'S3': None, 'S4': None},
-        'position': {},
+        'desc': '极端行情仍扫描A级候选；只允许技术焦点强板块前排走1/12狙击例外',
+        'strategies': {'S1': 'trial', 'S2': 'trial', 'S3': 'trial', 'S4': 'trial'},
+        # M5不在策略循环内用5日动量预先删票；最终由“当日逆势强度+板块同步+买入区”专门闸门裁决。
+        'sector_cutoff': {'S1': 0.0, 'S2': 0.0, 'S3': 0.0, 'S4': 0.0},
+        'position': {'S1_A': '1/12', 'S2_A': '1/12', 'S3_A': '1/12', 'S4_A': '1/12'},
         's3_x2_limit': 20,
         's3_x2_relax': None,
     },
@@ -250,8 +252,8 @@ def detect_market_mode(verbose=True):
 
     # V6.1: 情绪周期修正模式判定
     # 高潮日：仓位减半，不追新仓
-    # 分歧/退潮：仓位减半，只守不攻
-    position_modifier = 1.0  # 1.0=正常，0.5=减半，0=禁止
+    # 分歧减半；退潮只保留技术焦点强板块的1/12狙击例外；过热仍全禁。
+    position_modifier = 1.0  # 1.0=正常，0.5=减半，约0.33=M5狙击模式，0=禁止
     cycle_warning = ''
     if cycle_phase == '高潮':
         position_modifier = 0.5
@@ -260,9 +262,9 @@ def detect_market_mode(verbose=True):
         position_modifier = 0.5
         cycle_warning = '⚠️ 情绪分歧期！仓位减半，只守不攻，等方向明确。'
     elif cycle_phase == '退潮':
-        position_modifier = 0  # 退潮期不开新仓
-        cycle_warning = '⛔ 情绪退潮期！禁止开新仓，等待冰点信号。'
-        mode = 'M5'  # 强制降级到空仓模式
+        position_modifier = 1 / 3
+        cycle_warning = '🌊 情绪退潮期：普通候选禁止开仓；仅技术焦点池中通过逆势板块闸门的A级前排可小仓试错（优先1/12、降权1/16）。'
+        mode = 'M5'
         config = MODE_CONFIG['M5']
     elif cycle_phase == '过热':
         position_modifier = 0
@@ -271,6 +273,13 @@ def detect_market_mode(verbose=True):
         config = MODE_CONFIG['M5']
     elif cycle_phase == '冰点':
         cycle_warning = '🧊 情绪冰点，可开始S1蓄力选股，等待反转。'
+
+    # 指数本身触发M5时也保留同一小仓例外；“过热”不开放例外。
+    if mode == 'M5' and cycle_phase != '过热':
+        position_modifier = min(position_modifier, 1 / 3)
+        if not cycle_warning:
+            cycle_warning = '⛔ M5极端环境：普通候选禁止开仓；仅技术焦点池中通过逆势板块闸门的A级前排可小仓试错（优先1/12、降权1/16）。'
+    m5_focus_exception = mode == 'M5' and cycle_phase != '过热' and position_modifier > 0
 
     details = {
         'composite_emotion': composite,
@@ -282,6 +291,7 @@ def detect_market_mode(verbose=True):
         'cycle_score': cycle_score,
         'cycle_data': cycle_data,
         'position_modifier': position_modifier,
+        'm5_focus_exception': m5_focus_exception,
         'cycle_warning': cycle_warning,
         'freshness': freshness,
     }
@@ -303,7 +313,7 @@ def _print_report(mode, config, details):
     index_data = details['index_data']
 
     print("=" * 80)
-    print(f"  市场模式判定 (V10主线趋势版) — {config['emoji']} {mode} {config['name']}")
+    print(f"  市场模式判定 (V11板块优先版) — {config['emoji']} {mode} {config['name']}")
     print("=" * 80)
     print()
 
@@ -343,7 +353,13 @@ def _print_report(mode, config, details):
     pe = phase_emoji_map.get(cycle_phase, '❓')
     print(f"  情绪周期: {pe} {cycle_phase} (得分{cycle_score}/12)")
     if pos_mod < 1:
-        print(f"  仓位修正: ×{pos_mod} ({'减半' if pos_mod == 0.5 else '禁止开仓'})")
+        if pos_mod == 0:
+            pos_text = '禁止开仓'
+        elif pos_mod == 0.5:
+            pos_text = '减半'
+        else:
+            pos_text = '仅保留技术主线1/12狙击例外'
+        print(f"  仓位修正: ×{pos_mod:.2f} ({pos_text})")
     if cycle_warning:
         print(f"  ❗ {cycle_warning}")
 
@@ -384,8 +400,13 @@ def _print_report(mode, config, details):
     print()
     print("  ── 附加规则 ──")
     print("    · 同行业/同板块候选不去重，最终榜按优先级展示，上限15只")
-    print("    · 实际执行由用户按序取舍，今日最多新开2只")
+    print("    · 实际执行采用主狙击1只+备用1只；备用仅替补，今日最多实际新开1只")
     print("    · 非主力试探策略只允许A级候选，仓位按V8表缩小")
+    if mode == 'M5':
+        if details.get('m5_focus_exception'):
+            print("    · M5普通候选仅观察；技术焦点池通过全部闸门后，明日优先1/12、降权1/16")
+        else:
+            print("    · 当前M5不开放技术主线例外，全部候选仅观察")
     print()
 
 
@@ -412,6 +433,7 @@ def get_mode_params():
         'cycle_phase': details.get('cycle_phase', '\u672a\u77e5'),
         'cycle_score': details.get('cycle_score', 0),
         'position_modifier': details.get('position_modifier', 1.0),
+        'm5_focus_exception': details.get('m5_focus_exception', False),
         'cycle_warning': details.get('cycle_warning', ''),
         'sector_rotation': details.get('cycle_data', {}).get('sector_rotation', {}),
         'freshness': details.get('freshness', {}),
