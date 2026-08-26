@@ -274,10 +274,62 @@ def init_db():
             pctChg          DOUBLE,
             change_amount   DOUBLE,
             turn            DOUBLE,
+            data_source     VARCHAR(32)  NOT NULL DEFAULT 'legacy_unknown',
+            quality_status  VARCHAR(16)  NOT NULL DEFAULT 'unverified',
             updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (board_code, date),
             KEY idx_em_board_daily_level_date (level, date),
-            KEY idx_em_board_daily_date (date)
+            KEY idx_em_board_daily_date (date),
+            KEY idx_em_board_daily_source (data_source, quality_status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+
+        # 聚合/派生板块行情必须与东财官方板块指数物理隔离，禁止再混写。
+        """CREATE TABLE IF NOT EXISTS em_board_daily_proxy (
+            board_code      VARCHAR(16)  NOT NULL,
+            level           TINYINT      NOT NULL,
+            date            DATE         NOT NULL,
+            open            DOUBLE,
+            high            DOUBLE,
+            low             DOUBLE,
+            close           DOUBLE,
+            volume          DOUBLE,
+            amount          DOUBLE,
+            amplitude       DOUBLE,
+            pctChg          DOUBLE,
+            change_amount   DOUBLE,
+            turn            DOUBLE,
+            proxy_method    VARCHAR(48)  NOT NULL,
+            updated_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (board_code, date),
+            KEY idx_em_board_proxy_level_date (level, date),
+            KEY idx_em_board_proxy_method (proxy_method)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+
+        # 历史污染行先隔离备份，再从正式表移除/重建，确保可追溯与可恢复。
+        """CREATE TABLE IF NOT EXISTS em_board_daily_quarantine (
+            id                  BIGINT       NOT NULL AUTO_INCREMENT,
+            repair_batch        VARCHAR(32)  NOT NULL,
+            board_code          VARCHAR(16)  NOT NULL,
+            level               TINYINT      NOT NULL,
+            date                DATE         NOT NULL,
+            open                DOUBLE,
+            high                DOUBLE,
+            low                 DOUBLE,
+            close               DOUBLE,
+            volume              DOUBLE,
+            amount              DOUBLE,
+            amplitude           DOUBLE,
+            pctChg              DOUBLE,
+            change_amount       DOUBLE,
+            turn                DOUBLE,
+            original_source     VARCHAR(32),
+            original_quality    VARCHAR(16),
+            quarantine_reason   VARCHAR(128) NOT NULL,
+            original_updated_at TIMESTAMP    NULL,
+            quarantined_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uk_em_board_quarantine_batch (repair_batch, board_code, date),
+            KEY idx_em_board_quarantine_code_date (board_code, date)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 
         # ═══ 交易记录表 ═══
@@ -368,9 +420,49 @@ def init_db():
             except Exception:
                 pass
 
+    _ensure_em_board_daily_columns(conn)
     _ensure_trade_log_columns(conn)
 
     conn.close()
+
+
+def _ensure_em_board_daily_columns(conn):
+    """Add source provenance to older em_board_daily installations."""
+    columns = {
+        row[0] for row in conn.execute(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='em_board_daily'"
+        ).fetchall()
+    }
+    additions = [
+        (
+            "data_source",
+            "ALTER TABLE em_board_daily ADD COLUMN data_source VARCHAR(32) "
+            "NOT NULL DEFAULT 'legacy_unknown' AFTER turn",
+        ),
+        (
+            "quality_status",
+            "ALTER TABLE em_board_daily ADD COLUMN quality_status VARCHAR(16) "
+            "NOT NULL DEFAULT 'unverified' AFTER data_source",
+        ),
+    ]
+    for name, sql in additions:
+        if name in columns:
+            continue
+        conn.execute(sql)
+        conn.commit()
+    index_names = {
+        row[0] for row in conn.execute(
+            "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='em_board_daily'"
+        ).fetchall()
+    }
+    if "idx_em_board_daily_source" not in index_names:
+        conn.execute(
+            "CREATE INDEX idx_em_board_daily_source "
+            "ON em_board_daily(data_source, quality_status)"
+        )
+        conn.commit()
 
 
 def _ensure_trade_log_columns(conn):
@@ -624,7 +716,11 @@ def replace_em_stock_board_l3(rows):
     return len(rows)
 
 
-def upsert_em_board_daily(rows):
+def upsert_em_board_daily(
+    rows,
+    data_source="eastmoney_official",
+    quality_status="verified",
+):
     """
     批量写入东方财富三层行业板块日K。
     rows: list of (board_code, level, date, open, high, low, close,
@@ -632,13 +728,15 @@ def upsert_em_board_daily(rows):
     """
     if not rows:
         return 0
+    values = [tuple(row) + (data_source, quality_status) for row in rows]
     conn = get_connection()
     conn.executemany("""
         INSERT INTO em_board_daily (
             board_code, level, date, open, high, low, close,
-            volume, amount, amplitude, pctChg, change_amount, turn
+            volume, amount, amplitude, pctChg, change_amount, turn,
+            data_source, quality_status
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             level=VALUES(level),
             open=VALUES(open),
@@ -650,8 +748,36 @@ def upsert_em_board_daily(rows):
             amplitude=VALUES(amplitude),
             pctChg=VALUES(pctChg),
             change_amount=VALUES(change_amount),
-            turn=VALUES(turn)
-    """, rows)
+            turn=VALUES(turn),
+            data_source=VALUES(data_source),
+            quality_status=VALUES(quality_status)
+    """, values)
+    conn.commit()
+    conn.close()
+    return len(rows)
+
+
+def upsert_em_board_daily_proxy(rows, proxy_method="constituent_average_price"):
+    """Write non-official board aggregates to the physically separate proxy table."""
+    if not rows:
+        return 0
+    values = [tuple(row) + (proxy_method,) for row in rows]
+    conn = get_connection()
+    conn.executemany("""
+        INSERT INTO em_board_daily_proxy (
+            board_code, level, date, open, high, low, close,
+            volume, amount, amplitude, pctChg, change_amount, turn, proxy_method
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s
+        )
+        ON DUPLICATE KEY UPDATE
+            level=VALUES(level), open=VALUES(open), high=VALUES(high),
+            low=VALUES(low), close=VALUES(close), volume=VALUES(volume),
+            amount=VALUES(amount), amplitude=VALUES(amplitude),
+            pctChg=VALUES(pctChg), change_amount=VALUES(change_amount),
+            turn=VALUES(turn), proxy_method=VALUES(proxy_method)
+    """, values)
     conn.commit()
     conn.close()
     return len(rows)

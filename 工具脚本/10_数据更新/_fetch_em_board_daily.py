@@ -6,8 +6,8 @@
   先运行 _fetch_em_board_hierarchy.py 写入 em_board_l1/l2/l3。
 
 写入：
-  em_board_daily(board_code, level, date, open, high, low, close,
-                 volume, amount, amplitude, pctChg, change_amount, turn)
+  官方指数 -> em_board_daily
+  成分股均价聚合 -> em_board_daily_proxy（禁止混写官方指数表）
 """
 import argparse
 import os
@@ -33,7 +33,12 @@ if str(_COMMON_DIR) not in sys.path:
     sys.path.insert(0, str(_COMMON_DIR))
 from project_paths import ensure_tool_paths
 ensure_tool_paths()
-from db_cache import get_connection, init_db, upsert_em_board_daily
+from db_cache import (
+    get_connection,
+    init_db,
+    upsert_em_board_daily,
+    upsert_em_board_daily_proxy,
+)
 
 
 KLINE_URLS = [
@@ -350,7 +355,7 @@ def aggregate_from_stock_klines(levels, days=20, full=False, end_date=None, miss
             for i in range(0, len(codes), 300):
                 part = codes[i:i + 300]
                 ph = ",".join(["?"] * len(part))
-                sql = f"SELECT board_code, date FROM em_board_daily WHERE board_code IN ({ph}) AND date >= ?"
+                sql = f"SELECT board_code, date FROM em_board_daily_proxy WHERE board_code IN ({ph}) AND date >= ?"
                 params = part + [start_date]
                 if end_date:
                     sql += " AND date <= ?"
@@ -380,7 +385,11 @@ def main():
     parser.add_argument("--sleep", type=float, default=0.03, help="每个板块间隔秒数")
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=12.0)
-    parser.add_argument("--aggregate-only", action="store_true", help="跳过官方BK K线，直接用成分股日K聚合")
+    parser.add_argument(
+        "--aggregate-only",
+        action="store_true",
+        help="跳过官方BK K线，将成分股日K聚合写入独立代理表",
+    )
     parser.add_argument("--official-only", action="store_true", help="只用官方BK K线，失败不聚合兜底")
     parser.add_argument("--official-fail-stop", type=int, default=8, help="官方接口连续失败N个板块后切到聚合兜底")
     parser.add_argument("--snapshot-only", action="store_true", help="only write official Eastmoney quote snapshot for end-date")
@@ -443,7 +452,7 @@ def main():
             if idx % 50 == 0 or idx == len(boards):
                 print(f"  官方进度 {idx:>4d}/{len(boards)}  成功{ok}  失败{len(fail)}  已写{written + len(buffer)}")
             if (not args.official_only) and consecutive_fail >= args.official_fail_stop:
-                print(f"  官方BK K线连续失败 {consecutive_fail} 个板块，切换到成分股聚合兜底")
+                print(f"  官方BK K线连续失败 {consecutive_fail} 个板块，切换到独立聚合代理表")
                 switched_to_aggregate = True
                 break
             if args.sleep > 0:
@@ -471,14 +480,16 @@ def main():
         )
         agg_written = 0
         for i in range(0, len(agg_rows), 5000):
-            agg_written += upsert_em_board_daily(agg_rows[i:i + 5000])
-        written += agg_written
+            agg_written += upsert_em_board_daily_proxy(
+                agg_rows[i:i + 5000],
+                proxy_method="constituent_average_price",
+            )
         if agg_rows:
             agg_boards = len({r[0] for r in agg_rows})
             agg_dates = sorted({str(r[2])[:10] for r in agg_rows})
-            print(f"  聚合兜底写入/更新: {agg_written} 行  板块:{agg_boards}  日期:{agg_dates[0]}~{agg_dates[-1]}")
+            print(f"  聚合代理写入/更新 em_board_daily_proxy: {agg_written} 行  板块:{agg_boards}  日期:{agg_dates[0]}~{agg_dates[-1]}")
         else:
-            print("  聚合兜底无新增行（可能 em_board_daily 已有对应日期）")
+            print("  聚合代理无新增行（em_board_daily_proxy 已有对应日期）")
 
     print("-" * 86)
     print(f"  写入/更新 em_board_daily: {written} 行  成功板块:{ok}  失败:{len(fail)}")

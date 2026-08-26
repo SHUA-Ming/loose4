@@ -33,7 +33,13 @@ from db_cache import get_connection, init_db
 
 
 DROP_STATUS = {"D", "U"}
-MAIN_INDEX_CODES = ("sh.000001", "sz.399001", "sz.399006")
+MAIN_INDEX_CODES = (
+    "sh.000001",  # 上证指数
+    "sh.000016",  # 上证50
+    "sh.000300",  # 沪深300
+    "sz.399001",  # 深证成指
+    "sz.399006",  # 创业板指
+)
 
 
 def _to_float(value, default=0.0):

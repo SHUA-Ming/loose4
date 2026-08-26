@@ -35,7 +35,13 @@ ensure_tool_paths()
 from db_cache import get_connection, init_db, upsert_kline_batch
 from sina_kline import fetch_kline
 
-INDEX_CODES = {"sh.000001", "sz.399001", "sz.399006"}
+INDEX_CODES = {
+    "sh.000001",  # 上证指数
+    "sh.000016",  # 上证50
+    "sh.000300",  # 沪深300
+    "sz.399001",  # 深证成指
+    "sz.399006",  # 创业板指
+}
 
 
 def ymd(value):
@@ -56,6 +62,11 @@ def load_last_dates(include_index=True):
     out = {row[0]: ymd(row[1]) for row in kline_rows}
     for row in pool_rows:
         out.setdefault(row[0], "")
+    if include_index:
+        # Keep required broad indices in the update universe even before their
+        # first row exists in kline_daily.
+        for code in INDEX_CODES:
+            out.setdefault(code, "")
     if not include_index:
         out = {code: date for code, date in out.items() if code not in INDEX_CODES}
     return out
